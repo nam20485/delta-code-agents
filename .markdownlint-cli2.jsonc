@@ -1,0 +1,6 @@
+{
+  // Table rows, fenced code, and headings cannot wrap at 80 columns.
+  "config": {
+    "MD013": { "tables": false, "code_blocks": false, "headings": false }
+  }
+}
