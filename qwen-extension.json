@@ -1,0 +1,146 @@
+{
+  "name": "delta-qwen",
+  "version": "0.1.0",
+  "displayName": "Delta",
+  "description": "Record Qwen Code sessions and their Git checkouts into Delta threads.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${extensionPath}/dist/src/hook.js\"",
+            "name": "delta-session-start",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${extensionPath}/dist/src/hook.js\"",
+            "name": "delta-session-end",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-prompt-submit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-message-display",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-pre-tool-use",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-post-tool-use",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-post-tool-use-failure",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-stop",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-stop-failure",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-subagent-start",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47631/event",
+            "name": "delta-subagent-stop",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

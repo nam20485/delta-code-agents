@@ -19,18 +19,20 @@ Nothing reads or writes Delta's database directly; everything goes through the
 ```mermaid
 flowchart TB
   subgraph QwenCode["Qwen Code session (user's normal TUI)"]
-    H["Hook events<br/>(stdin JSON, per event)"]
+    H["Hooks: SessionStart = command hook<br/>(bootstraps router, maintains launcher);<br/>all other events = native http hooks"]
     C["Slash commands<br/>commands/*.md → !{ node #quot;$HOME/.qwen/delta/cli.js#quot; ... }"]
   end
-  subgraph Sidecar["Session sidecar (detached node proc, one per session)"]
-    S1["HTTP API 127.0.0.1 + token"]
+  subgraph Daemon["User-level router + per-session sidecars"]
+    R["router, fixed port 47631, 127.0.0.1<br/>multiplexes by session_id"]
+    S1["sidecar HTTP (ephemeral port + token)"]
     ST["state + outbox.jsonl + inbox.jsonl<br/>~/.qwen/delta/sessions/&lt;session_id&gt;/"]
     W["thread watch --participate"]
   end
   D["delta CLI"]
   T["Delta thread"]
-  H --"fast POST (event json)"--> S1
+  H --"http POST (event json)"--> R
   C --"share/join/setup/org"--> D
+  R --> S1
   S1 --"thread create/append/capture/status/stop"--> D
   S1 --"worktree create/attach/mount"--> D
   W --"item / turn / producer.turn frames"--> S1
@@ -39,47 +41,64 @@ flowchart TB
 
 Three parts:
 
-1. **Extension package** — `qwen-extension.json` registering all hooks
-   (single dispatcher command: `node ${extensionPath}/dist/hook.js`; every
-   hook gets a `name` so it can be disabled individually via `/hooks`) and
-   the slash commands. Installed with `qwen extensions install <repo>` or
-   `qwen extensions link .` for development. Inline manifest hooks are
-   path-hydrated at load (`${extensionPath}` works linked and installed);
-   command `.md` files are not — see the launcher below.
-2. **Hook dispatcher (`dist/hook.js`)** — reads the event JSON on stdin, POSTs
-   it to the sidecar on localhost (token-authed), exits fast. Never blocks the
-   model except by design: the `PreToolUse` supersession gate and the
-   `UserPromptSubmit` inbox injection. Fail-open on sidecar errors (recording
-   must never break the session): exit 0 with no output on any failure —
-   exit 2 would *block* the tool. Synchronous hooks carry short explicit
-   timeouts (2–5s, not the 60s default) so a hung sidecar cannot stall a turn.
-   If a state dir exists but the sidecar is down, the hook restarts it under
-   an atomic pidfile + liveness check (hooks run in parallel by default; two
-   dispatchers must not spawn two sidecars). Single dependency-free bundled
-   file: every event pays a node spawn, so keep it minimal. The dispatcher
-   also maintains `~/.qwen/delta/cli.js`, a launcher pointing at the hydrated
-   extension's `dist/cli.js` — the stable entrypoint slash commands call,
-   since `!{}` runs in the session cwd and command markdown gets no runtime
-   path substitution (install-time rewriting skips linked extensions).
-3. **Session sidecar (`dist/sidecar.js`)** — detached node process owning all
-   long-lived work: Delta thread, outbox, `worktree mount` child process,
-   `thread watch` child process, remote inbox, supersession flag. State lives
-   in `~/.qwen/delta/sessions/<session_id>/` (also survives qwen crashes and
+1. **Extension package** — `qwen-extension.json` registering one named hook
+   per event and the slash commands. **SessionStart is the only command
+   hook** (`node ${extensionPath}/dist/src/hook.js`): it bootstraps the
+   router and maintains the `~/.qwen/delta/cli.js` launcher. Every other
+   event is a **native `type: "http"` hook** POSTing to
+   `http://127.0.0.1:47631/event` (loopback is exempt from Qwen's SSRF
+   policy), so per-event delivery costs one localhost request, not a node
+   spawn (measured below). Installed with `qwen extensions install <repo>`
+   or `qwen extensions link .` for development.
+2. **Hook dispatcher (`dist/src/hook.js`)** — reads the SessionStart event
+   JSON on stdin, ensures the router is up (lock-guarded detached spawn +
+   health wait), learns qwen's pid from its own process ancestry
+   (`delta_qwen_pid` payload field — http-delivered events cannot walk the
+   tree), POSTs the event, and exits. Fail-open: exit 0, no output on any
+   failure — exit 2 would *block* startup. Short explicit timeouts (2–5 s).
+   If invoked with a non-SessionStart event (tests, tools) it forwards it to
+   the router unchanged.
+3. **Router (`dist/src/router/router.js`, fixed port 47631, `127.0.0.1`)** —
+   a user-level daemon multiplexing sessions by `session_id`: spawns
+   per-session sidecars on first SessionStart (single writer in process, so
+   no spawn race), forwards each event to the session's sidecar using the
+   token in its `state.json`, relays the sidecar's response (PreToolUse deny,
+   inbox context) back to Qwen, and respawns a dead sidecar once before
+   failing open with `{}`. Idle-exits when no request arrived for 10
+   minutes. Loopback-only, JSON-body-capped, session ids validated by
+   charset; any local process could otherwise POST forged events — accepted
+   v1 risk, documented (follow-up: user-scope settings hook with
+   `${ENV}`-interpolated Authorization header, which http hooks support via
+   `allowedEnvVars`).
+4. **Session sidecar (`dist/src/sidecar/server.js`)** — detached node process
+   per recorded session, spawned by the router, owning all long-lived work:
+   Delta thread, outbox, `worktree mount` child process, `thread watch`
+   child process, remote inbox, supersession flag. State lives in
+   `~/.qwen/delta/sessions/<session_id>/` (survives qwen crashes and
    `/resume`); session dirs are `0700`, token/state files `0600`. Spawned
    fully detached (new session/process group, stdio ignored, unref) so
    Qwen's async-hook process-tree reclamation on exit cannot kill it.
 
-### Why a sidecar
+### Why a router plus per-session sidecars
 
 Delta needs a mount process running for the whole session and a watch process
-running while turns run; hooks are short-lived processes with no memory. A
-per-session daemon bridges the two models, exactly the role Claude Code's
-in-process plugin runtime plays for delta-claude. It is discovered via a port+
-token file in the session state dir, so every hook invocation finds it cheaply.
+running while turns run; hooks are short-lived with no memory. M1 originally
+spawned a node dispatcher per hook event, but measurement on the target
+machine killed that: dispatcher wall-clock was **336–397 ms p95** (bare
+`node -e ""` alone is ~115 ms; process teardown after `exit()` adds
+~150–280 ms), against a 100 ms budget. A direct localhost POST to the sidecar
+measures **11 ms p50**, so per-event delivery moved to Qwen's native http
+hooks. The http hook URL is static in the manifest, which forces a fixed-port
+daemon; per-session sidecars stay separate so a sidecar crash costs one
+session, teardown stays a clean process exit, and M1's state/lifecycle code
+survives unchanged. The SessionStart command hook pays one ~400 ms spawn per
+session to bootstrap the router and learn qwen's pid — acceptable at
+session start.
 
 ### Lifecycle and orphans
 
-The sidecar polls qwen's pid (learned from the spawning hook's parent chain).
+The router polls nothing; the sidecar polls qwen's pid (learned from the
+SessionStart command hook's ancestry and refreshed on resume).
 On owner death it ends the watch and any open `capture`, lets Delta idle the
 turn (Delta ends a running turn when the watch ends and the owner has exited),
 keeps the mount for a grace period in case of `/resume`, then TERMs the mount
@@ -103,8 +122,10 @@ and crashes, where no hook fires.
 │   ├── delta-inbox.md         # show pending remote activity
 │   └── delta-org.md           # list | current | switch | invite | create
 ├── src/
-│   ├── hook.ts                # stdin JSON → sidecar client (all events)
+│   ├── hook.ts                # SessionStart dispatcher: ensure router, forward event
 │   ├── cli.ts                 # slash-command entry (share/join/setup/org/...)
+│   ├── router/
+│   │   └── router.ts          # fixed-port daemon: session multiplexing, sidecar spawn
 │   ├── sidecar/
 │   │   ├── server.ts          # HTTP API + lifecycle (spawn, orphan cleanup)
 │   │   ├── state.ts           # state.json read/write, locking
@@ -251,13 +272,21 @@ commands expand to prompts, so a model-mediated "ask first" is not reliable.
 - **Command entrypoint** is `node "$HOME/.qwen/delta/cli.js"` — `!{}` runs in
   the session cwd, command markdown is not runtime-hydrated, and install-time
   `${CLAUDE_PLUGIN_ROOT}` rewriting skips linked extensions. The dispatcher
-  maintains the launcher from its hydrated `${extensionPath}`; a stale
-  launcher (extension uninstalled) fails with reinstall instructions.
-- **Per-event node spawn** adds latency to every tool call and prompt; the
-  dispatcher is a single dependency-free file and Milestone 1 measures the
-  overhead. If unacceptable, the fallback architecture is native `http`
-  hooks (loopback is allowed) to a fixed-port user-level daemon multiplexed
-  by `session_id`.
+  maintains the launcher from its hydrated `${extensionPath}` on SessionStart;
+  a stale launcher (extension uninstalled) fails with reinstall instructions.
+- **Per-event delivery uses native http hooks** (decided in M1 by
+  measurement): command-hook dispatch measured 336–397 ms p95 per event on
+  the target machine — bare node startup (~115 ms) plus undici cold-init
+  (~65–90 ms) plus slow process teardown (~150–280 ms) — versus 11 ms p50
+  for a direct localhost POST. Trade-offs accepted: any local process can
+  POST forged events to the loopback router (no per-request secret is
+  possible with a static manifest URL; follow-up: user-scope hook settings
+  with `${ENV}` header interpolation), and a router death mid-session loses
+  events until the next SessionStart (no command hook fires to revive it;
+  recording degrades, the supersession gate fails open).
+- **`/resume` keeps `session_id`** (verified headless in M1: `qwen --resume
+  <id>` reuses the id; `--fork-session` is the opt-in new-id path), so
+  session state keys on `session_id` safely.
 - **User-message provenance**: `UserPromptSubmit` also fires for continuation
   paths; only record when `submitted_prompt` is present, dedupe by
   `prompt_id`, cross-check against transcript on share. Accept imperfection in
@@ -314,10 +343,15 @@ in a throwaway Git repo:
 
 ## Milestones
 
-1. **Scaffold**: repo, manifest + hooks registration, hook dispatcher,
-   sidecar lifecycle (state dir, HTTP, orphan cleanup), `delta-cli.ts`.
-   Assert early: `/resume` keeps `session_id`; link-mode command launcher
-   resolves; measure per-event hook latency.
+1. **Scaffold**: repo, manifest + hooks registration (SessionStart command
+   hook, others http), router, hook dispatcher, sidecar lifecycle (state
+   dir, HTTP, orphan cleanup), `delta-cli.ts`.
+   Asserted: `/resume` keeps `session_id` (headless, verified);
+   link-mode command launcher resolves (link creates a directory with
+   `.qwen-extension-install.json` metadata, not a symlink — the launcher
+   does not depend on that); per-event latency measured 336–397 ms p95 via
+   command hooks → **switched to native http hooks + fixed-port router**
+   (direct POST 11 ms p50).
 2. **Recording**: manual `/delta-share` path — checkout adoption
    (`--existing-checkout`), capture start/stop, thread/mount/outbox/append
    with user/agent/tool/turn records; receipts and retries.
