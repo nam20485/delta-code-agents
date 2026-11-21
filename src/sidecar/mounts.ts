@@ -41,14 +41,11 @@ export class Mounts {
       sessionId: string;
       ownerPid: () => number | null;
       captureEnabled: () => boolean;
+      sessionActive: () => boolean;
       log: (line: string) => void;
       onCaptureUnavailable: () => void;
     },
   ) {}
-
-  get hasChildren(): boolean {
-    return this.children.length > 0;
-  }
 
   /** Restart the mount children for an already-adopted checkout (after a
    * sidecar restart) using the persisted worktree reference. */
@@ -68,13 +65,36 @@ export class Mounts {
       stdio: ["ignore", "ignore", "ignore"],
       detached: false,
     });
+    // A failed spawn (e.g. missing exec bit) must not crash the sidecar.
+    child.on("error", (err) => {
+      this.opts.log(`${label}: spawn failed: ${err.message}`);
+      this.prune();
+    });
     this.children.push({ label, child });
     child.on("exit", (code, signal) => {
       this.opts.log(`${label} exited (${signal ?? "code " + String(code)})`);
+      this.prune();
+      if (this.opts.sessionActive() && signal === null && code !== 0) {
+        // A mount child dying mid-session means silent file-sync loss.
+        this.opts.log(`${label} died unexpectedly; file sync stopped for this session`);
+      }
     });
     return child;
   }
 
+  private prune(): void {
+    for (let i = this.children.length - 1; i >= 0; i--) {
+      const entry = this.children[i]!;
+      if (entry.child.exitCode !== null || entry.child.signalCode !== null) {
+        this.children.splice(i, 1);
+      }
+    }
+  }
+
+  get hasChildren(): boolean {
+    this.prune();
+    return this.children.length > 0;
+  }
   async adoptCheckout(cwd: string): Promise<AdoptResult> {
     if (cwd.length === 0) return { ok: false, reason: "no working directory" };
     const isGit = await git(cwd, ["rev-parse", "--is-inside-work-tree"]);

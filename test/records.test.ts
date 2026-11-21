@@ -56,3 +56,12 @@ test("truncate bounds long content and titles", () => {
   assert.equal(truncate("abcdef", 5).length, 5);
   assert.ok(truncate("x".repeat(10_000)).length <= 4_000);
 });
+
+test("truncate never splits a surrogate pair", () => {
+  // "a" + astral emoji (2 code units) repeated: cutting mid-pair would emit
+  // a lone high surrogate before the ellipsis.
+  const value = "a" + "\u{1F600}".repeat(10);
+  const out = truncate(value, 4);
+  assert.ok(!/[\uD800-\uDBFF]$/.test(out.slice(0, -1)), `no trailing lone surrogate: ${JSON.stringify(out)}`);
+  assert.ok(out.endsWith("…"));
+});

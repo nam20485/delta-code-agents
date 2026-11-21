@@ -79,11 +79,14 @@ async function waitForEndpoint(
   }
 }
 
-function spawnSidecar(sessionId: string, dir: string): void {
+function spawnSidecar(sessionId: string, dir: string, revive = false): void {
   ensureDir(dir);
   const sidecarJs = fileURLToPath(new URL("../sidecar/server.js", import.meta.url));
   // Fully detached so nothing in Qwen's or the router's lifecycle reaps it.
-  const child = spawn(process.execPath, [sidecarJs, sessionId], {
+  // --revive lets an explicit SessionStart resurrect an ended session's
+  // state; other events never do.
+  const args = revive ? [sidecarJs, sessionId, "--revive"] : [sidecarJs, sessionId];
+  const child = spawn(process.execPath, args, {
     detached: true,
     stdio: "ignore",
   });
@@ -135,12 +138,11 @@ async function forward(
       return { kind: "ok", body: {} };
     }
   } catch (err) {
-    const code =
-      typeof err === "object" && err !== null && "cause" in err
-        ? String((err as { cause?: unknown }).cause)
-        : "";
+    // Only an actual deadline is "busy". Connection resets, terminated
+    // sockets, and unknown transport errors mean the sidecar may be gone;
+    // treating them as busy would drop the event without any respawn.
     return {
-      kind: err instanceof Error && err.name === "TimeoutError" ? "timeout" : code.includes("ECONNREFUSED") ? "unreachable" : "timeout",
+      kind: err instanceof Error && err.name === "TimeoutError" ? "timeout" : "unreachable",
       body: {},
     };
   }
@@ -149,6 +151,9 @@ async function forward(
 export class Router {
   private lastActivity = Date.now();
   private readonly logFile = join(deltaRoot(), "router.log");
+  /** One delivery chain per session: concurrent events must not race the
+   * respawn decision or spawn two sidecar writers on one state dir. */
+  private readonly chains = new Map<string, Promise<unknown>>();
 
   log(line: string): void {
     void appendFile(this.logFile, `${new Date().toISOString()} ${line}\n`).catch(() => {});
@@ -162,8 +167,21 @@ export class Router {
    * Deliver one hook event. Returns the sidecar's hook response, or `{}` on
    * any failure — Qwen treats a non-2xx http hook as a non-blocking failure,
    * but we still answer 200 with an empty object so nothing degrades.
+   * Events for one session are serialized; sessions are independent.
    */
-  async handleEvent(event: Record<string, unknown>): Promise<unknown> {
+  handleEvent(event: Record<string, unknown>): Promise<unknown> {
+    const sessionId = event["session_id"];
+    const key = typeof sessionId === "string" ? sessionId : "invalid";
+    const previous = this.chains.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(() => this.handleEventInner(event));
+    this.chains.set(key, next);
+    void next.finally(() => {
+      if (this.chains.get(key) === next) this.chains.delete(key);
+    });
+    return next;
+  }
+
+  private async handleEventInner(event: Record<string, unknown>): Promise<unknown> {
     const sessionId = event["session_id"];
     if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) return {};
     const name = event["hook_event_name"];
@@ -176,9 +194,11 @@ export class Router {
 
     let endpoint = readSidecarEndpoint(dir);
     if (endpoint === null) {
-      // Unknown session: only SessionStart starts recording.
+      // Unknown session: only SessionStart starts recording. A retained
+      // ended session revives only on an explicit SessionStart (resume),
+      // never on a stray late event for a dead owner.
       if (name !== "SessionStart") return {};
-      spawnSidecar(sessionId, dir);
+      spawnSidecar(sessionId, dir, true);
       endpoint = await waitForEndpoint(dir, SPAWN_WAIT_MS);
       if (endpoint === null) {
         this.log(`sidecar spawn failed for ${sessionId}`);
@@ -200,7 +220,7 @@ export class Router {
     // replacement to actually serve before retrying — state.json still names
     // the dead port until the new sidecar rewrites it.
     this.log(`sidecar for ${sessionId} unreachable; respawning`);
-    spawnSidecar(sessionId, dir);
+    spawnSidecar(sessionId, dir, name === "SessionStart");
     const revived = await waitForEndpoint(dir, SPAWN_WAIT_MS, endpoint);
     if (revived === null) return {};
     const retry = await forward(revived, event);

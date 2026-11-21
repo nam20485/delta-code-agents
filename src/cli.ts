@@ -89,9 +89,18 @@ async function share(confirm: boolean): Promise<number> {
         authorization: `Bearer ${session["token"]}`,
       },
       body: JSON.stringify({ confirm }),
-      signal: AbortSignal.timeout(30_000),
+      // Worst-case first share: contract + create + adoption + share, each
+      // a delta call with its own 15s budget, run serially on the sidecar.
+      signal: AbortSignal.timeout(90_000),
     });
   } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      console.error(
+        "The share request is still running on the sidecar (slow network?); " +
+          "check `delta-qwen doctor` before retrying.",
+      );
+      return 1;
+    }
     console.error(`Cannot reach the session sidecar: ${String(err)}`);
     return 1;
   }

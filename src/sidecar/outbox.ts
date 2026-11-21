@@ -53,16 +53,26 @@ export class Outbox {
 
   static load(file: string): OutboxLine[] {
     if (!existsSync(file)) return [];
+    const raw = readFileSync(file, "utf8");
     const lines: OutboxLine[] = [];
-    for (const raw of readFileSync(file, "utf8").split("\n")) {
-      const trimmed = raw.trim();
+    let clean = true;
+    for (const chunk of raw.split("\n")) {
+      const trimmed = chunk.trim();
       if (trimmed.length === 0) continue;
       try {
         lines.push(JSON.parse(trimmed) as OutboxLine);
       } catch {
-        // A torn final line from a crash is dropped; its sequence is never
-        // reused because counters live in state.json.
+        // A torn line from a crash mid-append (possibly concatenated with
+        // the next record). Drop it; its sequence is never reused because
+        // counters live in state.json and are clamped on load.
+        clean = false;
       }
+    }
+    if (!clean) {
+      // Self-heal: rewrite without the fragments so later appends cannot
+      // concatenate onto a torn tail and lose intact records.
+      const rebuilt = lines.map((line) => JSON.stringify(line)).join("\n");
+      atomicWriteFile(file, rebuilt.length > 0 ? `${rebuilt}\n` : "");
     }
     return lines;
   }
@@ -79,10 +89,10 @@ export class Outbox {
   }
 
   add(line: OutboxLine): void {
-    this.pending.push(line);
-    // Line append: a crash mid-write leaves one torn line, which load()
-    // drops; the record's sequence is still consumed via the load-time clamp.
+    // Durable first: if the append fails (ENOSPC/EACCES) the record is not
+    // queued and the sequence is not consumed — save-before-send holds.
     appendFileSync(this.file, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+    this.pending.push(line);
   }
 
   private serialize(): string {
@@ -142,6 +152,7 @@ export class Outbox {
     }
     let delivered = 0;
     let superseded = false;
+    let unknownDisposition: string | null = null;
     const kept: OutboxLine[] = [];
     for (const line of this.pending) {
       const disposition = receipts.get(line.sequence);
@@ -149,6 +160,11 @@ export class Outbox {
         delivered += 1;
       } else if (disposition === "fenced") {
         superseded = true;
+      } else if (disposition !== undefined) {
+        // A disposition this version does not recognize: surface it as an
+        // error instead of retrying forever behind a success-shaped outcome.
+        unknownDisposition = disposition;
+        kept.push(line);
       } else {
         // No receipt (partial batch failure): keep for retry.
         kept.push(line);
@@ -156,6 +172,16 @@ export class Outbox {
     }
     this.pending = kept;
     this.persist();
+    if (unknownDisposition !== null) {
+      return {
+        delivered,
+        superseded,
+        reloadRequired: false,
+        error: { message: `unrecognized receipt disposition: ${unknownDisposition}` },
+        retryable: false,
+        retryAfterMs: null,
+      };
+    }
     return { delivered, superseded, reloadRequired: false, error: null, retryable: false, retryAfterMs: null };
   }
 }

@@ -252,6 +252,57 @@ test("stop failure note uses a distinct id so the partial reply survives", () =>
   assert.equal((partial?.content as { text: string }[])[0]?.text, "partial answer");
 });
 
+test("duplicate final after Stop does not reopen a phantom turn", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p1", submitted_prompt: "go" });
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "answer", is_final: true });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "answer" });
+  const before = h.sink.size;
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "answer", is_final: true });
+  assert.equal(h.sink.size, before);
+});
+
+test("restart with a finalized last message rejects stale shorter redelivery", () => {
+  const recording: RecordingState = {
+    enabled: true,
+    consent: "granted",
+    thread_id: "t",
+    next_sequence: 4,
+    superseded: false,
+    paused: false,
+    capture_enabled: true,
+    titled: true,
+    turn_state: { turnSequence: 1, lastMessageId: "m1", lastMessageFinal: true },
+  };
+  const sink = new MemorySink();
+  const r = new Recorder({
+    outbox: sink,
+    recording,
+    capture: { start: () => {}, stop: () => {} },
+    log: () => {},
+    save: () => {},
+  });
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "short", is_final: false });
+  assert.equal(sink.size, 0);
+  // A genuinely new message still records under the restored turn.
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m2", displayed_text: "new", is_final: true });
+  assert.equal(sink.size, 1);
+  assert.equal(sink.lines[0]?.turnSequence, 1);
+});
+
+test("Stop without any MessageDisplay records the answer under a derived id", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p1", submitted_prompt: "go" });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "the only copy" });
+  const answer = emitted(h).find(
+    (e) => e.sessionUpdate === "agent_message" && e.messageId === "a-stop-1",
+  );
+  assert.notEqual(answer, undefined);
+  assert.equal((answer?.content as { text: string }[])[0]?.text, "the only copy");
+});
+
 test("events before enablement and subagent events are dropped", () => {
   const h = harness();
   const dropped = new Recorder({

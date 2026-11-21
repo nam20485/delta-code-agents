@@ -125,6 +125,7 @@ export class Sidecar {
   private recorder: Recorder | null = null;
   private mounts: Mounts | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
+  private shareInFlightConfirm = false;
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
   constructor(state: SessionState, dir: string) {
@@ -170,6 +171,7 @@ export class Sidecar {
         sessionId: this.state.session_id,
         ownerPid: () => this.state.qwen_pid,
         captureEnabled: () => this.state.recording?.capture_enabled !== false,
+        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
         log: (line) => this.log(line),
         onCaptureUnavailable: () => {
           if (this.state.recording !== undefined) {
@@ -215,13 +217,14 @@ export class Sidecar {
     };
   }
 
-  private async tryFlush(): Promise<void> {
+  private async tryFlush(force = false): Promise<void> {
     const recorder = this.ensureRecorder();
     if (recorder === null || this.outbox === null) return;
     // Retry policy (plan): retry only when `error.retryable`, honoring
     // `retry_after_ms`; after a non-retryable error, wait for new records.
+    // `force` (shutdown's final attempt) bypasses the guards.
     const err = this.lastFlushError;
-    if (err !== null) {
+    if (!force && err !== null) {
       if (!err.retryable && this.outbox.size === err.size) return;
       if (err.retryable && Date.now() - err.at < Math.max(err.retryAfterMs, 250)) return;
     }
@@ -236,21 +239,37 @@ export class Sidecar {
     } else {
       this.lastFlushError = null;
     }
-    if (outcome.superseded && this.state.recording !== undefined) {
-      this.state.recording.superseded = true;
-      this.save();
-      this.log("superseded by a teammate; recording of new turn content stops");
-    }
-    if (outcome.reloadRequired && this.state.recording !== undefined) {
-      this.state.recording.paused = true;
-      this.save();
-      this.log("reload_required; recording paused (resolve the thread in Delta)");
+    // Recording failures must never kill the sidecar: disk-full during
+    // flush bookkeeping rejects here, and every caller is fire-and-forget.
+    try {
+      if (outcome.superseded && this.state.recording !== undefined) {
+        this.state.recording.superseded = true;
+        this.save();
+        this.log("superseded by a teammate; recording of new turn content stops");
+      }
+      if (outcome.reloadRequired && this.state.recording !== undefined) {
+        this.state.recording.paused = true;
+        this.save();
+        this.log("reload_required; recording paused (resolve the thread in Delta)");
+      }
+    } catch (err) {
+      this.log(`flush bookkeeping failed: ${String(err)}`);
     }
   }
 
   /** CLI-driven share flow (`cli.ts share [--confirm]`). */
   share(confirm: boolean): Promise<ShareResponse> {
-    if (this.shareInFlight !== null) return this.shareInFlight;
+    if (this.shareInFlight !== null) {
+      // A confirming caller must not receive the unconfirmed call's answer.
+      if (confirm !== this.shareInFlightConfirm) {
+        return Promise.resolve({
+          status: "error",
+          message: "a share request is already in flight; retry once it completes",
+        });
+      }
+      return this.shareInFlight;
+    }
+    this.shareInFlightConfirm = confirm;
     this.shareInFlight = this.doShare(confirm).finally(() => {
       this.shareInFlight = null;
     });
@@ -341,8 +360,16 @@ export class Sidecar {
         const deferred: (() => void)[] = [];
         const response = await this.handleEvent(event, (fn) => deferred.push(fn));
         sendJson(res, 200, response);
-        res.on("finish", () => {
-          for (const fn of deferred) fn();
+        // 'close' fires on success AND client abort; 'finish' never fires
+        // when the client drops the connection before the flush completes.
+        res.on("close", () => {
+          for (const fn of deferred) {
+            try {
+              fn();
+            } catch {
+              // Fire-and-forget side effects must not crash the listener.
+            }
+          }
         });
         return;
       }
@@ -446,8 +473,10 @@ export class Sidecar {
     if (this.flushTimer !== null) clearInterval(this.flushTimer);
     this.log(`shutdown: ${reason}`);
     // Final flush before tearing down mounts, bounded by the delta timeout.
+    // Force it: the retry guards (backoff / non-retryable-without-new-
+    // records) must not let the sidecar exit without a last delivery try.
     try {
-      await this.tryFlush();
+      await this.tryFlush(true);
     } catch {
       // Best effort.
     }
@@ -497,8 +526,15 @@ function cleanupStaleSessions(currentSessionId: string): void {
     } catch {
       continue;
     }
-    // Undelivered records outrank every grace period.
-    if (new Outbox(join(dir, "outbox.jsonl")).size > 0) continue;
+    // Undelivered records outrank every grace period. A stat check avoids
+    // reading/parsing megabytes of outbox per session on the event loop.
+    let outboxBytes = 0;
+    try {
+      outboxBytes = statSync(join(dir, "outbox.jsonl")).size;
+    } catch {
+      // No outbox file.
+    }
+    if (outboxBytes > 0) continue;
     const state = loadState(dir);
     if (state === null) {
       if (ageMs > 24 * 60 * 60_000) {
@@ -542,10 +578,10 @@ export async function startSidecar(sessionId: string): Promise<void> {
   let state = loadState(dir);
   if (state === null || state.session_id !== sessionId) {
     state = newState(sessionId);
-  } else {
-    // Resume, never reset: an ended session with recording enabled carries
-    // thread identity, sequence counters, consent, and possibly an undrained
-    // outbox — all of which must survive `/resume` and sidecar restarts.
+  } else if (state.ended_at !== undefined && process.argv.includes("--revive")) {
+    // Revive ONLY on an explicit SessionStart (resume). A stray late event
+    // for an ended session must not resurrect it and its mounts for a dead
+    // owner (the pid may even have been recycled by another process).
     delete state.ended_at;
   }
   saveState(dir, state);

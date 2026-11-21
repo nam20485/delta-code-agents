@@ -56,9 +56,9 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 
 function sidecarPid(): number | null {
   try {
-    // Compiled entry is dist/src/sidecar/server.js; anchor on the session id
-    // so neither this test process nor a shell echoes back as a match.
-    const out = execFileSync("pgrep", ["-f", `sidecar/server\.js it-1$`], {
+    // Compiled entry is dist/src/sidecar/server.js; SessionStart spawns
+    // carry --revive, so anchor on the session id with an optional flag.
+    const out = execFileSync("pgrep", ["-f", `sidecar/server\.js it-1( --revive)?$`], {
       encoding: "utf8",
     }).trim();
     const first = out.split("\n")[0];

@@ -58,6 +58,9 @@ export class Recorder {
   private readonly deps: RecorderDeps;
   private turn: TurnInfo | null;
   private readonly messages = new Map<string, MessageProgress>();
+  /** Finalized message ids survive closeTurn so duplicate late finals
+   * cannot reopen a phantom turn (bounded; oldest evicted). */
+  private readonly finalized = new Set<string>();
   private readonly seenPrompts = new Set<string>();
   private flushing: Promise<FlushOutcome> | null = null;
 
@@ -68,6 +71,17 @@ export class Recorder {
       deps.recording.turn_state !== undefined
         ? { ...deps.recording.turn_state }
         : null;
+    // A restart loses the in-memory messages map, but the persisted turn
+    // knows its last message was final: seed the map so stale shorter
+    // redeliveries cannot overwrite the finalized text.
+    if (
+      this.turn !== null &&
+      this.turn.lastMessageId !== null &&
+      this.turn.lastMessageFinal
+    ) {
+      this.messages.set(this.turn.lastMessageId, { text: "", final: true });
+      this.finalized.add(this.turn.lastMessageId);
+    }
     // Clamp the counter above anything already persisted in the outbox, so a
     // crash between the two writes can never reuse a sequence.
     const floor = deps.outbox.maxPendingSequence() + 1;
@@ -119,6 +133,14 @@ export class Recorder {
     };
     this.persistTurn();
     return turnSequence;
+  }
+
+  private markFinal(messageId: string): void {
+    this.finalized.add(messageId);
+    if (this.finalized.size > 500) {
+      const oldest = this.finalized.values().next().value;
+      if (oldest !== undefined) this.finalized.delete(oldest);
+    }
   }
 
   private closeTurn(): void {
@@ -197,6 +219,9 @@ export class Recorder {
     const messageId = this.str(event["message_id"]);
     const text = this.str(event["displayed_text"]);
     if (messageId === null || text === null) return;
+    // Already finalized (possibly in a previous turn or before a restart):
+    // a redelivered final must not reopen a phantom turn.
+    if (this.finalized.has(messageId)) return;
     const isFinal = event["is_final"] === true;
     if (this.turn === null) {
       // Late finals after a restart (or a dropped prompt) still belong to a
@@ -207,12 +232,20 @@ export class Recorder {
       this.openTurn();
     }
     const turn = this.turn!;
+    if (
+      turn.lastMessageId === messageId &&
+      turn.lastMessageFinal
+    ) {
+      // Persisted-final guard across restarts (messages map was lost).
+      return;
+    }
     const progress = this.messages.get(messageId);
     if (progress !== undefined) {
       if (progress.final) return; // stale delivery after the final one
       if (text.length <= progress.text.length && !isFinal) return;
     }
     this.messages.set(messageId, { text, final: isFinal });
+    if (isFinal) this.markFinal(messageId);
     turn.lastMessageId = messageId;
     turn.lastMessageFinal = isFinal;
     this.emit(agentMessage(`a-${messageId}`, text), turn.turnSequence);
@@ -274,15 +307,17 @@ export class Recorder {
       );
     } else {
       const last = this.str(event["last_assistant_message"]);
-      if (
-        last !== null &&
-        last.trim().length > 0 &&
-        turn.lastMessageId !== null &&
-        !turn.lastMessageFinal
-      ) {
-        // Cancellation can suppress the final MessageDisplay delivery; reuse
-        // the last message id so the text is not duplicated.
-        this.emit(agentMessage(`a-${turn.lastMessageId}`, last), turn.turnSequence);
+      if (last !== null && last.trim().length > 0) {
+        if (turn.lastMessageId !== null && !turn.lastMessageFinal) {
+          // Cancellation can suppress the final MessageDisplay delivery; reuse
+          // the last message id so the text is not duplicated.
+          this.emit(agentMessage(`a-${turn.lastMessageId}`, last), turn.turnSequence);
+        } else if (turn.lastMessageId === null) {
+          // No streamed message ever arrived (restart after the prompt, or a
+          // host without MessageDisplay): the Stop text is the only copy of
+          // the answer; a fresh derived id cannot duplicate anything.
+          this.emit(agentMessage(`a-stop-${turn.turnSequence}`, last), turn.turnSequence);
+        }
       }
     }
     this.closeTurn();

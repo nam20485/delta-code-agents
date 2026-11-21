@@ -118,6 +118,9 @@ export function runDelta<T>(args: readonly string[], options: DeltaRunOptions = 
       clearTimeout(timer);
       resolve({ ok: false, error: { message: `failed to run delta: ${err.message}` }, stderr });
     });
+    // EPIPE when delta exits before draining stdin is not a sidecar crash;
+    // it flows through the normal exit-code path.
+    child.stdin.on("error", () => {});
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
@@ -188,6 +191,8 @@ function spawnCollect(
       clearTimeout(timer);
       resolve({ code: null, stdout, stderr });
     });
+    // EPIPE on early exit / timeout kill must not crash the caller.
+    child.stdin.on("error", () => {});
     child.on("close", (code) => {
       if (settled) return;
       settled = true;

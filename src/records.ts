@@ -19,7 +19,13 @@ const MAX_CONTENT_CHARS = 4_000;
 const MAX_TITLE_CHARS = 80;
 
 export function truncate(value: string, max = MAX_CONTENT_CHARS): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  if (value.length <= max) return value;
+  // Never cut a UTF-16 surrogate pair: a lone surrogate would serialize as
+  // an ill-formed escape in the record payload.
+  let end = max - 1;
+  const code = value.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return `${value.slice(0, end)}…`;
 }
 
 function textBlock(value: string): { type: "text"; text: string } {

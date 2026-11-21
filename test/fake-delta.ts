@@ -29,6 +29,11 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
+  if (args[0] === "thread" && args[1] === "append" && process.env["FAKE_UNKNOWN_DISPO"] === "1") {
+    process.stdout.write(`${JSON.stringify({ operation: "appended", sequence: 1, disposition: "rejected" })}\n`);
+    process.exitCode = 0;
+    return;
+  }
   if (args[0] === "thread" && args[1] === "capture") {
     // Match the real CLI: capture is allowlisted to claude-code only.
     process.stderr.write(
