@@ -17,6 +17,8 @@ export interface SessionState {
   cwd: string;
   /** Qwen transcript JSONL path, for mid-session share backfill. */
   transcript_path?: string;
+  /** Bumped on /clear so a new conversation gets fresh outbox/inbox files. */
+  generation: number;
   created_at: string;
   updated_at: string;
   ended_at?: string;
@@ -60,6 +62,7 @@ export function newState(sessionId: string): SessionState {
     port: 0,
     token: randomBytes(24).toString("hex"),
     cwd: "",
+    generation: 0,
     created_at: now,
     updated_at: now,
   };

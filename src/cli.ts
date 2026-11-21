@@ -129,22 +129,36 @@ function printShare(body: ShareResponse): number {
 }
 
 async function share(confirm: boolean, emails: string[]): Promise<number> {
-  let body: ShareResponse | null;
-  try {
-    body = await sidecarCall("/share", { confirm, emails });
-  } catch (err) {
-    if (err instanceof Error && err.name === "TimeoutError") {
-      console.error(
-        "The share request is still running on the sidecar (slow network?); " +
-          "check `delta-qwen doctor` before retrying.",
-      );
-      return 1;
-    }
-    console.error(`Cannot reach the session sidecar: ${String(err)}`);
-    return 1;
-  }
+  const body = await fetchSidecar("/share", { confirm, emails });
   if (body === null) return noSession();
   return printShare(body);
+}
+
+/**
+ * Wrap sidecarCall so a fetch failure is reported distinctly from "no live
+ * session" (sidecarCall returns null only when no session matches the cwd).
+ * A timeout means the request may still be running; other errors mean the
+ * sidecar is unreachable. Returns an error body (printShare exits non-zero).
+ */
+async function fetchSidecar(
+  path: string,
+  body?: unknown,
+  method: "POST" | "GET" = "POST",
+  timeoutMs = 90_000,
+): Promise<ShareResponse | null> {
+  try {
+    return await sidecarCall(path, body, method, timeoutMs);
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      return {
+        status: "error",
+        message:
+          `the ${path} request is still running on the sidecar (slow network?); ` +
+          "check `delta-qwen doctor` before retrying",
+      };
+    }
+    return { status: "error", message: `cannot reach the session sidecar: ${String(err)}` };
+  }
 }
 
 async function setup(mode: string, org: string | undefined): Promise<number> {
@@ -152,7 +166,7 @@ async function setup(mode: string, org: string | undefined): Promise<number> {
     console.error("usage: delta-qwen setup <private|team|manual> [--org ID]");
     return 1;
   }
-  const body = await sidecarCall("/setup", { mode, ...(org !== undefined ? { organization: org } : {}) }).catch(() => null);
+  const body = await fetchSidecar("/setup", { mode, ...(org !== undefined ? { organization: org } : {}) });
   if (body === null) return noSession();
   console.log(`Sync policy for this repository: ${mode}`);
   return printShare(body);
@@ -163,20 +177,24 @@ async function joinThreadCmd(link: string): Promise<number> {
     console.error("usage: delta-qwen join <thread-link>");
     return 1;
   }
-  const body = await sidecarCall("/join", { link }, "POST", 120_000).catch(() => null);
+  const body = await fetchSidecar("/join", { link }, "POST", 120_000);
   if (body === null) return noSession();
   return printShare(body);
 }
 
 async function simplePost(path: string): Promise<number> {
-  const body = await sidecarCall(path, {}).catch(() => null);
+  const body = await fetchSidecar(path, {});
   if (body === null) return noSession();
   return printShare(body);
 }
 
 async function inbox(): Promise<number> {
-  const body = await sidecarCall("/inbox", undefined, "GET", 10_000).catch(() => null);
+  const body = await fetchSidecar("/inbox", undefined, "GET", 10_000);
   if (body === null) return noSession();
+  if (body["status"] === "error") {
+    console.error(`inbox failed: ${String(body["message"])}`);
+    return 1;
+  }
   console.log(typeof body["text"] === "string" ? body["text"] : "(no remote activity)");
   return 0;
 }
@@ -250,16 +268,46 @@ async function doctor(): Promise<number> {
   return 0;
 }
 
+/**
+ * Command arguments. Slash-command templates pass user input via the
+ * DELTA_QWEN_ARGS environment variable (`--from-env`) so untrusted text is
+ * never parsed by the shell — only split here in JS. Direct CLI use reads
+ * process.argv.
+ */
+function commandArgs(): string[] {
+  const argv = process.argv.slice(3);
+  if (argv.includes("--from-env")) {
+    const raw = (process.env["DELTA_QWEN_ARGS"] ?? "").trim();
+    return raw.length === 0 ? [] : raw.split(/\s+/);
+  }
+  return argv;
+}
+
+/** Parse `setup <mode> [--org ID | --org=ID]` positionally. */
+function parseSetup(rest: string[]): { mode: string; org: string | undefined } {
+  let org: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    if (arg === "--org") {
+      org = rest[++i];
+    } else if (arg.startsWith("--org=")) {
+      org = arg.slice("--org=".length);
+    } else if (!arg.startsWith("--")) {
+      positional.push(arg);
+    }
+  }
+  return { mode: positional[0] ?? "", org };
+}
+
 const command = process.argv[2] ?? "help";
-const rest = process.argv.slice(3);
+const rest = commandArgs();
 if (command === "share") {
   const emails = rest.filter((a) => !a.startsWith("--") && a !== "confirm");
-  const confirm = process.argv.includes("--confirm") || rest.includes("confirm");
+  const confirm = rest.includes("--confirm") || rest.includes("confirm");
   process.exit(await share(confirm, emails));
 } else if (command === "setup") {
-  const mode = rest.find((a) => !a.startsWith("--")) ?? "";
-  const orgIdx = rest.indexOf("--org");
-  const org = orgIdx !== -1 ? rest[orgIdx + 1] : undefined;
+  const { mode, org } = parseSetup(rest);
   process.exit(await setup(mode, org));
 } else if (command === "join") {
   process.exit(await joinThreadCmd(rest[0] ?? ""));

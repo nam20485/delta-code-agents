@@ -98,6 +98,7 @@ export class Mounts {
       child.on("error", (err) => finish({ ok: false, error: err.message }));
       const lines = createInterface({ input: child.stdout! });
       lines.on("line", (line) => {
+        if (settled) return;
         const trimmed = line.trim();
         if (!trimmed.startsWith("{")) return;
         try {
@@ -110,6 +111,10 @@ export class Mounts {
             });
             finish({ ok: true, directory: frame.directory });
           } else if (frame.error !== undefined) {
+            // Kill and close: a delta that reports an error and stays alive
+            // would otherwise leak an untracked mount child.
+            child.kill("SIGTERM");
+            lines.close();
             finish({ ok: false, error: String(frame.error.message ?? "join failed") });
           }
         } catch {
