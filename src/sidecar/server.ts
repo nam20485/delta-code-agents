@@ -133,6 +133,7 @@ export class Sidecar {
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
   private enableInFlight: Promise<{ ok: true } | { ok: false; error: string }> | null = null;
+  private enableGeneration = -1;
   private eventBuffer: Record<string, unknown>[] = [];
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
@@ -342,12 +343,24 @@ export class Sidecar {
    * are buffered and replayed afterwards (not dropped).
    */
   private enableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (this.enableInFlight !== null) return this.enableInFlight;
-    this.enableInFlight = this.doEnableRecording().finally(() => {
-      this.enableInFlight = null;
-      this.drainEventBuffer();
+    const generation = this.state.generation;
+    if (this.enableInFlight !== null && this.enableGeneration === generation) {
+      return this.enableInFlight;
+    }
+    // A different generation (a /clear landed mid-enable): chain a fresh enable
+    // after the in-flight one (which aborts at its staleness check) so the new
+    // conversation is recorded rather than stranded on the stale promise.
+    const previous = this.enableInFlight ?? Promise.resolve({ ok: true as const });
+    const next = previous.catch(() => {}).then(() => this.doEnableRecording());
+    this.enableInFlight = next;
+    this.enableGeneration = generation;
+    void next.finally(() => {
+      if (this.enableInFlight === next) {
+        this.enableInFlight = null;
+        this.drainEventBuffer();
+      }
     });
-    return this.enableInFlight;
+    return next;
   }
 
   private async doEnableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -826,7 +839,9 @@ export class Sidecar {
 
     // Buffer events that arrive while an enable is in flight (recording not
     // yet enabled); they are replayed once the recorder exists, not dropped.
-    if (this.enableInFlight !== null) {
+    // SessionEnd is never buffered: it must always reach teardown even if the
+    // whole session lived inside the enable window (e.g. a one-shot qwen -p).
+    if (this.enableInFlight !== null && name !== "SessionEnd") {
       this.eventBuffer.push(event as Record<string, unknown>);
       return {};
     }
@@ -959,7 +974,7 @@ function cleanupStaleSessions(currentSessionId: string): void {
     let outboxBytes = 0;
     try {
       for (const entry of readdirSync(dir)) {
-        if (entry.startsWith("outbox-") && entry.endsWith(".jsonl")) {
+        if (entry === "outbox.jsonl" || (entry.startsWith("outbox-") && entry.endsWith(".jsonl"))) {
           outboxBytes += statSync(join(dir, entry)).size;
         }
       }
