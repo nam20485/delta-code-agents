@@ -61,3 +61,7 @@ prefixes: "add delta-qwen plugin plan", "ignore agent scratch and configure
 markdownlint". `main` is the working branch; `origin` is
 `github.com/nam20485/delta-code-agents` (also has a `development` branch). No
 PR template exists.
+
+Never merge a PR that has not had an automated review (e.g. kilo) with its
+comments resolved — unreviewed code does not land, even when CI is green. If
+no auto-reviewer runs, assign one or leave the PR open.
