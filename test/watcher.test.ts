@@ -169,3 +169,21 @@ test("an over-long author cannot stall the batch", () => {
   // first-entry slice alone would still pass a loose length bound.
   assert.ok(!batch!.text.includes("x".repeat(100)));
 });
+
+test("watch children/child/child.remove frames track subthreads", () => {
+  const inbox = freshInbox();
+  const view = new WatchView(inbox, effects());
+  view.apply({ type: "children", children: [
+    { thread_id: "c1", reference: "t#s=1", kind: "subagent", name: "Scout", status: "running" },
+    { thread_id: "c2", reference: "t#s=2", kind: "subthread", name: "Investigation", status: "unknown" },
+  ] });
+  assert.equal(view.children().length, 2);
+  view.apply({ type: "child", child: { thread_id: "c1", reference: "t#s=1", kind: "subagent", name: "Scout", status: "completed" } });
+  const c1 = view.children().find((c) => c["thread_id"] === "c1");
+  assert.equal(c1?.["status"], "completed");
+  view.apply({ type: "child.remove", thread_id: "c2" });
+  assert.equal(view.children().length, 1);
+  // A fresh children snapshot replaces the list.
+  view.apply({ type: "children", children: [] });
+  assert.equal(view.children().length, 0);
+});

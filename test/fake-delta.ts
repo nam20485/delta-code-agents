@@ -20,7 +20,11 @@ async function main(): Promise<void> {
     return;
   }
   if (args[0] === "thread" && args[1] === "create") {
-    process.stdout.write(`${JSON.stringify({ operation: "created", thread_id: "fake-thread", created: true })}\n`);
+    if (args.includes("--parent")) {
+      process.stdout.write(`${JSON.stringify({ operation: "created", thread_id: "fake-child", reference: "fake-thread#s=child", created: true })}\n`);
+    } else {
+      process.stdout.write(`${JSON.stringify({ operation: "created", thread_id: "fake-thread", created: true })}\n`);
+    }
     process.exitCode = 0;
     return;
   }
