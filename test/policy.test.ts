@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readPolicy, writePolicy, isSyncMode } from "../src/policy.js";
@@ -41,4 +41,21 @@ test("writePolicy without a .git dir still persists the policy", () => {
   writePolicy(dir, { mode: "private" });
   assert.deepEqual(readPolicy(dir), { mode: "private" });
   assert.equal(existsSync(join(dir, ".delta", "settings.json")), true);
+});
+
+test("writePolicy handles a .git file (linked worktree) without throwing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dq-policy-wt-"));
+  // Simulate a linked worktree: .git is a file pointing at a real git dir
+  // whose commondir holds info/exclude.
+  const realGit = join(dir, "real-git");
+  const wtGit = join(realGit, "worktrees", "wt");
+  mkdirSync(join(realGit, "info"), { recursive: true });
+  mkdirSync(wtGit, { recursive: true });
+  writeFileSync(join(wtGit, "commondir"), "../..\n");
+  writeFileSync(join(dir, ".git"), `gitdir: ${wtGit}\n`);
+  // Must not throw (ENOTDIR) and must persist the policy.
+  writePolicy(dir, { mode: "team" });
+  assert.deepEqual(readPolicy(dir), { mode: "team" });
+  const exclude = readFileSync(join(realGit, "info", "exclude"), "utf8");
+  assert.match(exclude, /^\.delta\/$/m);
 });

@@ -11,7 +11,7 @@ function transcript(lines: unknown[]): string {
   return file;
 }
 
-test("backfill reconstructs user, assistant, and tool records; skips thoughts", () => {
+test("backfill reconstructs user, assistant, and tool records; skips thoughts", async () => {
   const file = transcript([
     { uuid: "u1", type: "user", message: { role: "user", parts: [{ text: "fix the bug" }] } },
     { uuid: "a1", type: "assistant", message: { role: "model", parts: [{ text: "thinking hard", thought: true }, { text: "I will read the file." }, { functionCall: { id: "c1", name: "read_file", args: { file_path: "x" } } }] } },
@@ -19,7 +19,7 @@ test("backfill reconstructs user, assistant, and tool records; skips thoughts", 
     { uuid: "a2", type: "assistant", message: { role: "model", parts: [{ text: "Done." }] } },
     { uuid: "s1", type: "system", message: { parts: [] } },
   ]);
-  const updates = backfillTranscript(file);
+  const updates = await backfillTranscript(file);
   const kinds = updates.map((u) => u.sessionUpdate);
   assert.deepEqual(kinds, ["user_message", "agent_message", "tool_call_update", "agent_message"]);
   assert.equal(updates[0]?.messageId, "u-u1");
@@ -28,11 +28,21 @@ test("backfill reconstructs user, assistant, and tool records; skips thoughts", 
   assert.equal(updates[2]?.status, "completed");
 });
 
-test("backfill tolerates a missing file and torn lines", () => {
-  assert.deepEqual(backfillTranscript("/nonexistent/chat.jsonl"), []);
+test("multiple text parts in one line concatenate into a single record", async () => {
+  const file = transcript([
+    { uuid: "a1", type: "assistant", message: { role: "model", parts: [{ text: "before" }, { functionCall: { id: "c1", name: "edit", args: {} } }, { text: "after" }] } },
+  ]);
+  const updates = await backfillTranscript(file);
+  const messages = updates.filter((u) => u.sessionUpdate === "agent_message");
+  assert.equal(messages.length, 1);
+  assert.equal((messages[0]?.content as { text: string }[])[0]?.text, "before\nafter");
+});
+
+test("backfill tolerates a missing file and torn lines", async () => {
+  assert.deepEqual(await backfillTranscript("/nonexistent/chat.jsonl"), []);
   const file = join(mkdtempSync(join(tmpdir(), "dq-backfill-")), "chat.jsonl");
   writeFileSync(file, '{"uuid":"u1","type":"user","message":{"parts":[{"text":"hi"}]}}\n{"torn\n');
-  const updates = backfillTranscript(file);
+  const updates = await backfillTranscript(file);
   assert.equal(updates.length, 1);
   assert.equal(updates[0]?.sessionUpdate, "user_message");
 });
