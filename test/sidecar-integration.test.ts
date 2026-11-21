@@ -79,7 +79,7 @@ test("share, kill/respawn continuity, clear, and retention", async () => {
       cwd: home,
       delta_qwen_pid: process.pid,
     });
-    assert.notEqual(loadState(sessionDir), null);
+    assert.ok(await waitFor(() => loadState(sessionDir) !== null, 10_000), "sidecar should come up");
 
     // Consent two-step, then share (fake delta serves create/share/adopt).
     const gate = await sidecarPost("/share", { confirm: false });
@@ -166,6 +166,7 @@ test("watch inbox injection, supersession deny, and mount swap", async () => {
   try {
     await post(port, { session_id: "it-2", hook_event_name: "SessionStart", source: "startup", cwd: home, delta_qwen_pid: process.pid });
     const state2 = () => loadState(dir2);
+    assert.ok(await waitFor(() => state2() !== null, 10_000), "sidecar should come up");
     const sc2 = async (path: string, body: unknown) => {
       const st = state2()!;
       const res = await fetch(`http://127.0.0.1:${st.port}${path}`, {

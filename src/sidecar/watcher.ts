@@ -155,8 +155,12 @@ export class Watcher {
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "ignore"] });
     child.on("error", (err) => {
       this.opts.effects.log(`watch: spawn failed: ${err.message}`);
-      if (this.child === child) this.child = null;
-      this.scheduleRestart();
+      // Same scope as the exit handler: a stale child's error must not arm a
+      // restart that kills the healthy replacement.
+      if (this.child === child) {
+        this.child = null;
+        this.scheduleRestart();
+      }
     });
     this.child = child;
     const lines = createInterface({ input: child.stdout! });

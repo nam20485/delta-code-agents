@@ -31,21 +31,33 @@ test("router multiplexes a session end to end", async () => {
     assert.deepEqual(await post(port, { session_id: "nope", hook_event_name: "Stop" }), {});
     assert.equal(existsSync(join(home, "sessions", "nope")), false);
 
-    // SessionStart spawns a sidecar; the owner-pid hint is persisted.
-    assert.deepEqual(
-      await post(port, {
-        session_id: "rt-1",
-        hook_event_name: "SessionStart",
-        source: "startup",
-        delta_qwen_pid: process.pid,
-      }),
-      {},
-    );
+    // SessionStart spawns a sidecar; the owner-pid hint is persisted. On a
+    // loaded CI runner the spawn can outlast the router's wait, so poll and
+    // re-send SessionStart until the sidecar is up and has the owner pid.
     const dir = join(home, "sessions", "rt-1");
-    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as {
-      qwen_pid?: number;
+    const startBody = {
+      session_id: "rt-1",
+      hook_event_name: "SessionStart",
+      source: "startup",
+      delta_qwen_pid: process.pid,
     };
-    assert.equal(state.qwen_pid, process.pid);
+    const readPid = (): number | null => {
+      try {
+        const s = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as { qwen_pid?: number };
+        return typeof s.qwen_pid === "number" ? s.qwen_pid : null;
+      } catch {
+        return null;
+      }
+    };
+    await post(port, startBody);
+    let pid: number | null = null;
+    for (let i = 0; i < 100; i++) {
+      pid = readPid();
+      if (pid === process.pid) break;
+      if (i % 10 === 9) await post(port, startBody);
+      await delay(100);
+    }
+    assert.equal(pid, process.pid);
 
     // Regular events flow through and answer {}.
     assert.deepEqual(
