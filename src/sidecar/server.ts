@@ -7,14 +7,26 @@ import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import { ensureDir } from "../lib/fsx.js";
 import { pidAlive } from "../lib/proc.js";
+import { DELTA_SOURCE, PRODUCER_NAME } from "../lib/constants.js";
+import { REQUIRED_CONTRACT, runDelta, threadContract } from "../delta-cli.js";
 import { sessionDir, sessionsRoot } from "../lib/paths.js";
-import { loadState, newState, saveState, type SessionState } from "./state.js";
+import { loadState, newState, saveState, type RecordingState, type SessionState } from "./state.js";
+import { Outbox, type FlushTarget } from "./outbox.js";
+import { Recorder } from "./recorder.js";
+import { Mounts } from "./mounts.js";
 
 const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const OWNER_POLL_MS = 2_000;
 const OWNER_UNKNOWN_GRACE_MS = 60 * 60_000;
 const OWNER_DEAD_GRACE_MS = 15 * 60_000;
 const ENDED_GRACE_MS = 60_000;
+const FLUSH_RETRY_MS = 5_000;
+
+const CONSENT_TEXT =
+  "Delta will upload this session's conversation (prompts, replies, tool " +
+  "inputs and outputs) and the files in this Git checkout (staged, unstaged, " +
+  "and untracked files that are not ignored) to your organization, where " +
+  "teammates you share with can read them. Re-run with --confirm to share.";
 
 interface HookEventPayload {
   [key: string]: unknown;
@@ -22,6 +34,48 @@ interface HookEventPayload {
 
 export interface HookResponse {
   [key: string]: unknown;
+}
+
+export interface ShareResponse {
+  status: "consent_required" | "shared" | "error";
+  message?: string;
+  thread_id?: string;
+  url?: string;
+  warning?: string;
+}
+
+async function runDeltaCreate(
+  externalId: string,
+): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
+  const result = await runDelta<{ thread_id?: unknown }>([
+    "thread",
+    "create",
+    "--source",
+    DELTA_SOURCE,
+    "--external-id",
+    externalId,
+  ]);
+  if (!result.ok) return { ok: false, error: result.error.message };
+  const threadId = result.value["thread_id"];
+  if (typeof threadId !== "string" || threadId.length === 0) {
+    return { ok: false, error: "thread create returned no thread_id" };
+  }
+  return { ok: true, threadId };
+}
+
+async function runDeltaShare(
+  threadId: string,
+): Promise<{ ok: true; url: string | null } | { ok: false; error: string }> {
+  const result = await runDelta<{ url?: unknown }>([
+    "thread",
+    "share",
+    threadId,
+    "--visibility",
+    "organization",
+  ]);
+  if (!result.ok) return { ok: false, error: result.error.message };
+  const url = result.value["url"];
+  return { ok: true, url: typeof url === "string" ? url : null };
 }
 
 function bearerToken(req: IncomingMessage): string | undefined {
@@ -65,7 +119,14 @@ export class Sidecar {
   state: SessionState;
   private shuttingDown = false;
   private ownerTimer: NodeJS.Timeout | null = null;
+  private flushTimer: NodeJS.Timeout | null = null;
   private readonly startedAt = new Date().toISOString();
+  private outbox: Outbox | null = null;
+  private recorder: Recorder | null = null;
+  private mounts: Mounts | null = null;
+  private shareInFlight: Promise<ShareResponse> | null = null;
+  private shareInFlightConfirm = false;
+  private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
   constructor(state: SessionState, dir: string) {
     this.state = state;
@@ -76,6 +137,196 @@ export class Sidecar {
     void appendFile(join(this.dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`).catch(
       () => {},
     );
+  }
+
+  private save(): void {
+    saveState(this.dir, this.state);
+  }
+
+  private recordingState(): RecordingState {
+    if (this.state.recording === undefined) {
+      this.state.recording = {
+        enabled: false,
+        consent: "none",
+        thread_id: "",
+        next_sequence: 1,
+        superseded: false,
+        paused: false,
+        capture_enabled: true,
+        titled: false,
+      };
+      this.save();
+    }
+    return this.state.recording;
+  }
+
+  private ensureRecorder(): Recorder | null {
+    const recording = this.state.recording;
+    if (recording === undefined || !recording.enabled) return null;
+    if (this.recorder === null) {
+      this.outbox = new Outbox(join(this.dir, "outbox.jsonl"));
+      this.mounts = new Mounts({
+        threadId: recording.thread_id,
+        externalId: this.state.external_id,
+        sessionId: this.state.session_id,
+        ownerPid: () => this.state.qwen_pid,
+        captureEnabled: () => this.state.recording?.capture_enabled !== false,
+        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
+        log: (line) => this.log(line),
+        onCaptureUnavailable: () => {
+          if (this.state.recording !== undefined) {
+            this.state.recording.capture_enabled = false;
+            this.save();
+          }
+        },
+      });
+      this.recorder = new Recorder({
+        outbox: this.outbox,
+        recording,
+        capture: {
+          start: (id, tool) => this.mounts?.captureStart(id, tool),
+          stop: (id, tool) => this.mounts?.captureStop(id, tool),
+        },
+        log: (line) => this.log(line),
+        save: () => this.save(),
+      });
+      // A restart with recording already enabled must bring the checkout
+      // mounts back: conversation without file sync is silent degradation.
+      if (
+        typeof recording.worktree_reference === "string" &&
+        this.state.cwd.length > 0 &&
+        !this.mounts.hasChildren
+      ) {
+        void this.mounts.restore(recording.worktree_reference, this.state.cwd);
+      }
+      this.flushTimer = setInterval(() => {
+        void this.tryFlush();
+      }, FLUSH_RETRY_MS);
+      this.flushTimer.unref();
+    }
+    return this.recorder;
+  }
+
+  private flushTarget(): FlushTarget {
+    const recording = this.recordingState();
+    return {
+      threadId: recording.thread_id,
+      source: DELTA_SOURCE,
+      externalId: this.state.external_id,
+      producerName: PRODUCER_NAME,
+    };
+  }
+
+  private async tryFlush(force = false): Promise<void> {
+    const recorder = this.ensureRecorder();
+    if (recorder === null || this.outbox === null) return;
+    // Retry policy (plan): retry only when `error.retryable`, honoring
+    // `retry_after_ms`; after a non-retryable error, wait for new records.
+    // `force` (shutdown's final attempt) bypasses the guards.
+    const err = this.lastFlushError;
+    if (!force && err !== null) {
+      if (!err.retryable && this.outbox.size === err.size) return;
+      if (err.retryable && Date.now() - err.at < Math.max(err.retryAfterMs, 250)) return;
+    }
+    const outcome = await recorder.finish(this.flushTarget());
+    if (outcome.error !== null) {
+      this.lastFlushError = {
+        retryable: outcome.retryable,
+        retryAfterMs: outcome.retryAfterMs ?? 0,
+        at: Date.now(),
+        size: this.outbox.size,
+      };
+    } else {
+      this.lastFlushError = null;
+    }
+    // Recording failures must never kill the sidecar: disk-full during
+    // flush bookkeeping rejects here, and every caller is fire-and-forget.
+    try {
+      if (outcome.superseded && this.state.recording !== undefined) {
+        this.state.recording.superseded = true;
+        this.save();
+        this.log("superseded by a teammate; recording of new turn content stops");
+      }
+      if (outcome.reloadRequired && this.state.recording !== undefined) {
+        this.state.recording.paused = true;
+        this.save();
+        this.log("reload_required; recording paused (resolve the thread in Delta)");
+      }
+    } catch (err) {
+      this.log(`flush bookkeeping failed: ${String(err)}`);
+    }
+  }
+
+  /** CLI-driven share flow (`cli.ts share [--confirm]`). */
+  share(confirm: boolean): Promise<ShareResponse> {
+    if (this.shareInFlight !== null) {
+      // A confirming caller must not receive the unconfirmed call's answer.
+      if (confirm !== this.shareInFlightConfirm) {
+        return Promise.resolve({
+          status: "error",
+          message: "a share request is already in flight; retry once it completes",
+        });
+      }
+      return this.shareInFlight;
+    }
+    this.shareInFlightConfirm = confirm;
+    this.shareInFlight = this.doShare(confirm).finally(() => {
+      this.shareInFlight = null;
+    });
+    return this.shareInFlight;
+  }
+
+  private async doShare(confirm: boolean): Promise<ShareResponse> {
+    const recording = this.recordingState();
+    if (recording.consent !== "granted") {
+      if (!confirm) {
+        recording.consent = "asked";
+        this.save();
+        return { status: "consent_required", message: CONSENT_TEXT };
+      }
+      recording.consent = "granted";
+      this.save();
+    }
+    if (!recording.enabled) {
+      const contract = await threadContract();
+      if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
+        return {
+          status: "error",
+          message: contract.ok
+            ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
+            : contract.error.message,
+        };
+      }
+      const created = await runDeltaCreate(this.state.external_id);
+      if (!created.ok) return { status: "error", message: created.error };
+      recording.thread_id = created.threadId;
+      recording.enabled = true;
+      this.save();
+      if (this.state.cwd.length > 0) {
+        this.ensureRecorder();
+        const result = await this.mounts?.adoptCheckout(this.state.cwd);
+        if (result !== undefined && result.ok && typeof result.reference === "string") {
+          recording.worktree_reference = result.reference;
+          this.save();
+        } else if (result !== undefined && !result.ok) {
+          this.log(`conversation-only recording: ${result.reason ?? "unknown"}`);
+        }
+      }
+    }
+    this.ensureRecorder();
+    const shared = await runDeltaShare(recording.thread_id);
+    const warning =
+      this.state.recording?.capture_enabled === false
+        ? "this delta CLI attributes edits only for claude-code sessions; edits will appear unattributed"
+        : undefined;
+    const response: ShareResponse = {
+      status: shared.ok ? "shared" : "error",
+      thread_id: recording.thread_id,
+    };
+    if (shared.ok && shared.url !== null) response.url = shared.url;
+    if (!shared.ok) response.message = shared.error;
+    if (warning !== undefined) response.warning = warning;
+    return response;
   }
 
   async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -106,7 +357,36 @@ export class Sidecar {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        sendJson(res, 200, await this.handleEvent(event));
+        const deferred: (() => void)[] = [];
+        const response = await this.handleEvent(event, (fn) => deferred.push(fn));
+        sendJson(res, 200, response);
+        // 'close' fires on success AND client abort; 'finish' never fires
+        // when the client drops the connection before the flush completes.
+        res.on("close", () => {
+          for (const fn of deferred) {
+            try {
+              fn();
+            } catch {
+              // Fire-and-forget side effects must not crash the listener.
+            }
+          }
+        });
+        return;
+      }
+      if (req.method === "POST" && url === "/share") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const body = await readBody(req);
+        let request: { confirm?: unknown };
+        try {
+          request = JSON.parse(body.toString("utf8")) as { confirm?: unknown };
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        sendJson(res, 200, await this.share(request["confirm"] === true));
         return;
       }
       sendJson(res, 404, { error: "not found" });
@@ -119,7 +399,10 @@ export class Sidecar {
     }
   }
 
-  async handleEvent(event: HookEventPayload): Promise<HookResponse> {
+  async handleEvent(
+    event: HookEventPayload,
+    defer?: (fn: () => void) => void,
+  ): Promise<HookResponse> {
     const pidHint = event["delta_qwen_pid"];
     // SessionStart carries a fresh owner pid (http-delivered events cannot
     // walk the process tree), including on resume with a new qwen process.
@@ -132,15 +415,45 @@ export class Sidecar {
       saveState(this.dir, this.state);
       this.log(`owner pid ${pidHint}`);
     }
+    if (
+      event["hook_event_name"] === "SessionStart" &&
+      typeof event["cwd"] === "string" &&
+      event["cwd"].length > 0 &&
+      this.state.cwd.length === 0
+    ) {
+      this.state.cwd = event["cwd"];
+      this.save();
+    }
     const name =
       typeof event["hook_event_name"] === "string"
         ? (event["hook_event_name"] as string)
         : "unknown";
     this.log(`event ${name}`);
-    // M2 translates events into Delta records here (recorder, outbox, mounts,
-    // watch). M1 only proves the pipe and the lifecycle.
+    const recorder = this.ensureRecorder();
+    if (recorder !== null) {
+      recorder.record(event as Record<string, unknown>);
+    }
+    // Response first, side effects after: the router treats a slow or reset
+    // response as a dead sidecar and would spawn a second writer. Flushing
+    // and shutdown run after the response is written (defer), retried by the
+    // flush timer if the client is already gone.
+    if (name === "Stop" || name === "StopFailure") {
+      if (defer !== undefined) defer(() => void this.tryFlush());
+      else void this.tryFlush();
+    }
     if (name === "SessionEnd") {
-      this.shutdown("session end");
+      if (event["reason"] === "clear") {
+        // `/clear` is a conversation reset, not a session exit: no teardown.
+        // (Per-clear thread splitting via an external-id suffix lands in M4.)
+        if (defer !== undefined) defer(() => void this.tryFlush());
+        else void this.tryFlush();
+        return {};
+      }
+      if (defer !== undefined) {
+        defer(() => void this.shutdown("session end"));
+      } else {
+        void this.shutdown("session end");
+      }
     }
     return {};
   }
@@ -148,35 +461,54 @@ export class Sidecar {
   startOwnerPolling(): void {
     this.ownerTimer = setInterval(() => {
       const pid = this.state.qwen_pid;
-      if (pid !== null && !pidAlive(pid)) this.shutdown("owner exit");
+      if (pid !== null && !pidAlive(pid)) void this.shutdown("owner exit");
     }, OWNER_POLL_MS);
     this.ownerTimer.unref();
   }
 
-  shutdown(reason: string): void {
+  async shutdown(reason: string): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     if (this.ownerTimer !== null) clearInterval(this.ownerTimer);
+    if (this.flushTimer !== null) clearInterval(this.flushTimer);
     this.log(`shutdown: ${reason}`);
-    this.state.ended_at = new Date().toISOString();
+    // Final flush before tearing down mounts, bounded by the delta timeout.
+    // Force it: the retry guards (backoff / non-retryable-without-new-
+    // records) must not let the sidecar exit without a last delivery try.
     try {
-      saveState(this.dir, this.state);
+      await this.tryFlush(true);
     } catch {
       // Best effort.
     }
-    // M1 keeps nothing worth surviving a clean end; M2's outbox will retain
-    // session state until records are drained and acknowledged instead.
+    const pending = this.outbox?.size ?? 0;
+    this.mounts?.stopAll();
+    this.state.ended_at = new Date().toISOString();
     try {
-      rmSync(this.dir, { recursive: true, force: true });
+      this.save();
     } catch {
-      // Best effort; stale-session cleanup removes it later.
+      // Best effort.
+    }
+    // Recording sessions retain their dir: the outbox may hold undelivered
+    // records, and a later /resume must continue the same thread's sequence
+    // counters (never restart from 1). cleanupStaleSessions reaps them after
+    // a long grace once the outbox is drained.
+    if (this.state.recording?.enabled === true) {
+      this.log(`retaining recording session dir (pending ${pending})`);
+    } else {
+      try {
+        rmSync(this.dir, { recursive: true, force: true });
+      } catch {
+        // Best effort; stale-session cleanup removes it later.
+      }
     }
     process.exit(0);
   }
 }
 
 /** Remove dead sessions' state. Called on sidecar start ("a new session that
- * finds a stale state dir cleans it up after the same liveness check"). */
+ * finds a stale state dir cleans it up after the same liveness check"). Dirs
+ * with undelivered records are never deleted; ended recording sessions get a
+ * long grace so a `/resume` can continue the sequence counters. */
 function cleanupStaleSessions(currentSessionId: string): void {
   let entries;
   try {
@@ -194,6 +526,15 @@ function cleanupStaleSessions(currentSessionId: string): void {
     } catch {
       continue;
     }
+    // Undelivered records outrank every grace period. A stat check avoids
+    // reading/parsing megabytes of outbox per session on the event loop.
+    let outboxBytes = 0;
+    try {
+      outboxBytes = statSync(join(dir, "outbox.jsonl")).size;
+    } catch {
+      // No outbox file.
+    }
+    if (outboxBytes > 0) continue;
     const state = loadState(dir);
     if (state === null) {
       if (ageMs > 24 * 60 * 60_000) {
@@ -205,8 +546,10 @@ function cleanupStaleSessions(currentSessionId: string): void {
       }
       continue;
     }
+    const recordingGrace =
+      state.recording?.enabled === true ? 24 * 60 * 60_000 : ENDED_GRACE_MS;
     if (state.ended_at !== undefined) {
-      if (ageMs > ENDED_GRACE_MS) {
+      if (ageMs > recordingGrace) {
         try {
           rmSync(dir, { recursive: true, force: true });
         } catch {
@@ -233,8 +576,13 @@ export async function startSidecar(sessionId: string): Promise<void> {
   const dir = sessionDir(sessionId);
   ensureDir(dir);
   let state = loadState(dir);
-  if (state === null || state.ended_at !== undefined || state.session_id !== sessionId) {
+  if (state === null || state.session_id !== sessionId) {
     state = newState(sessionId);
+  } else if (state.ended_at !== undefined && process.argv.includes("--revive")) {
+    // Revive ONLY on an explicit SessionStart (resume). A stray late event
+    // for an ended session must not resurrect it and its mounts for a dead
+    // owner (the pid may even have been recycled by another process).
+    delete state.ended_at;
   }
   saveState(dir, state);
   const sidecar = new Sidecar(state, dir);
@@ -253,8 +601,8 @@ export async function startSidecar(sessionId: string): Promise<void> {
   cleanupStaleSessions(sessionId);
   sidecar.log(`listening on 127.0.0.1:${address.port}`);
   sidecar.startOwnerPolling();
-  process.on("SIGTERM", () => sidecar.shutdown("sigterm"));
-  process.on("SIGINT", () => sidecar.shutdown("sigint"));
+  process.on("SIGTERM", () => void sidecar.shutdown("sigterm"));
+  process.on("SIGINT", () => void sidecar.shutdown("sigint"));
 }
 
 const invokedAsMain = (() => {

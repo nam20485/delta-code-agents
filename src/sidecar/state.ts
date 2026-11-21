@@ -6,16 +6,45 @@ import { atomicWriteJson, readJson } from "../lib/fsx.js";
 export interface SessionState {
   version: 1;
   session_id: string;
-  /** External id for `delta thread create`; suffixed on `clear` (M2). */
+  /** External id for `delta thread create`; suffixed on `clear` (M4). */
   external_id: string;
   clear_count: number;
   /** Qwen Code owner process, learned from the first hook event. */
   qwen_pid: number | null;
   port: number;
   token: string;
+  /** Session working directory (SessionStart payload), for cli discovery. */
+  cwd: string;
   created_at: string;
   updated_at: string;
   ended_at?: string;
+  recording?: RecordingState;
+}
+
+/** Recording enablement, thread identity, and record counters. */
+export interface RecordingState {
+  enabled: boolean;
+  consent: "none" | "asked" | "granted";
+  thread_id: string;
+  worktree_reference?: string;
+  /** Next record sequence; never reused, survives outbox draining. */
+  next_sequence: number;
+  superseded: boolean;
+  /** Paused after `reload_required` until the user resolves the thread. */
+  paused: boolean;
+  /** Capture disabled when the CLI rejects our source. */
+  capture_enabled: boolean;
+  titled: boolean;
+  /** Open turn, persisted so a sidecar restart mid-turn keeps its
+   * turnSequence and last-message tracking (late output keeps its original
+   * turnSequence after supersession or restart). */
+  turn_state?: TurnStateInfo;
+}
+
+export interface TurnStateInfo {
+  turnSequence: number;
+  lastMessageId: string | null;
+  lastMessageFinal: boolean;
 }
 
 export function newState(sessionId: string): SessionState {
@@ -28,6 +57,7 @@ export function newState(sessionId: string): SessionState {
     qwen_pid: null,
     port: 0,
     token: randomBytes(24).toString("hex"),
+    cwd: "",
     created_at: now,
     updated_at: now,
   };

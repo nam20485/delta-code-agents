@@ -42,21 +42,51 @@ function readSidecarEndpoint(dir: string): SidecarEndpoint | null {
   return { port, token };
 }
 
-async function waitForEndpoint(dir: string, timeoutMs: number): Promise<SidecarEndpoint | null> {
+async function endpointAlive(endpoint: SidecarEndpoint): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${endpoint.port}/health`, {
+      headers: { authorization: `Bearer ${endpoint.token}` },
+      signal: AbortSignal.timeout(300),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait for a *serving* sidecar endpoint in `state.json` — not just a present
+ * one: a dead sidecar's stale port lingers in the file until its replacement
+ * rewrites it, and forwarding to it would only fail again.
+ */
+async function waitForEndpoint(
+  dir: string,
+  timeoutMs: number,
+  dead?: SidecarEndpoint,
+): Promise<SidecarEndpoint | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const endpoint = readSidecarEndpoint(dir);
-    if (endpoint !== null) return endpoint;
+    if (
+      endpoint !== null &&
+      (dead === undefined || endpoint.port !== dead.port) &&
+      (await endpointAlive(endpoint))
+    ) {
+      return endpoint;
+    }
     if (Date.now() >= deadline) return null;
     await delay(POLL_MS);
   }
 }
 
-function spawnSidecar(sessionId: string, dir: string): void {
+function spawnSidecar(sessionId: string, dir: string, revive = false): void {
   ensureDir(dir);
   const sidecarJs = fileURLToPath(new URL("../sidecar/server.js", import.meta.url));
   // Fully detached so nothing in Qwen's or the router's lifecycle reaps it.
-  const child = spawn(process.execPath, [sidecarJs, sessionId], {
+  // --revive lets an explicit SessionStart resurrect an ended session's
+  // state; other events never do.
+  const args = revive ? [sidecarJs, sessionId, "--revive"] : [sidecarJs, sessionId];
+  const child = spawn(process.execPath, args, {
     detached: true,
     stdio: "ignore",
   });
@@ -81,8 +111,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** POST the event to the session sidecar; null on any failure (fail open). */
-async function forward(endpoint: SidecarEndpoint, event: Record<string, unknown>): Promise<unknown | null> {
+type ForwardKind = "ok" | "timeout" | "unreachable";
+
+/** POST the event to the session sidecar. `timeout` means the sidecar is
+ * alive but busy (do NOT respawn it); `unreachable` means it is gone. */
+async function forward(
+  endpoint: SidecarEndpoint,
+  event: Record<string, unknown>,
+): Promise<{ kind: ForwardKind; body: unknown }> {
   try {
     const res = await fetch(`http://127.0.0.1:${endpoint.port}/event`, {
       method: "POST",
@@ -93,18 +129,31 @@ async function forward(endpoint: SidecarEndpoint, event: Record<string, unknown>
       body: JSON.stringify(event),
       signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { kind: "ok", body: {} };
     const text = await res.text();
-    if (text.trim().length === 0) return {};
-    return JSON.parse(text) as unknown;
-  } catch {
-    return null;
+    if (text.trim().length === 0) return { kind: "ok", body: {} };
+    try {
+      return { kind: "ok", body: JSON.parse(text) as unknown };
+    } catch {
+      return { kind: "ok", body: {} };
+    }
+  } catch (err) {
+    // Only an actual deadline is "busy". Connection resets, terminated
+    // sockets, and unknown transport errors mean the sidecar may be gone;
+    // treating them as busy would drop the event without any respawn.
+    return {
+      kind: err instanceof Error && err.name === "TimeoutError" ? "timeout" : "unreachable",
+      body: {},
+    };
   }
 }
 
 export class Router {
   private lastActivity = Date.now();
   private readonly logFile = join(deltaRoot(), "router.log");
+  /** One delivery chain per session: concurrent events must not race the
+   * respawn decision or spawn two sidecar writers on one state dir. */
+  private readonly chains = new Map<string, Promise<unknown>>();
 
   log(line: string): void {
     void appendFile(this.logFile, `${new Date().toISOString()} ${line}\n`).catch(() => {});
@@ -118,8 +167,23 @@ export class Router {
    * Deliver one hook event. Returns the sidecar's hook response, or `{}` on
    * any failure — Qwen treats a non-2xx http hook as a non-blocking failure,
    * but we still answer 200 with an empty object so nothing degrades.
+   * Events for one session are serialized; sessions are independent.
    */
-  async handleEvent(event: Record<string, unknown>): Promise<unknown> {
+  handleEvent(event: Record<string, unknown>): Promise<unknown> {
+    const sessionId = event["session_id"];
+    const key = typeof sessionId === "string" ? sessionId : "invalid";
+    const previous = this.chains.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(() => this.handleEventInner(event));
+    this.chains.set(key, next);
+    void next
+      .finally(() => {
+        if (this.chains.get(key) === next) this.chains.delete(key);
+      })
+      .catch(() => {});
+    return next;
+  }
+
+  private async handleEventInner(event: Record<string, unknown>): Promise<unknown> {
     const sessionId = event["session_id"];
     if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) return {};
     const name = event["hook_event_name"];
@@ -132,9 +196,11 @@ export class Router {
 
     let endpoint = readSidecarEndpoint(dir);
     if (endpoint === null) {
-      // Unknown session: only SessionStart starts recording.
+      // Unknown session: only SessionStart starts recording. A retained
+      // ended session revives only on an explicit SessionStart (resume),
+      // never on a stray late event for a dead owner.
       if (name !== "SessionStart") return {};
-      spawnSidecar(sessionId, dir);
+      spawnSidecar(sessionId, dir, true);
       endpoint = await waitForEndpoint(dir, SPAWN_WAIT_MS);
       if (endpoint === null) {
         this.log(`sidecar spawn failed for ${sessionId}`);
@@ -144,15 +210,23 @@ export class Router {
     }
 
     const first = await forward(endpoint, event);
-    if (first !== null) return first;
+    if (first.kind === "ok") return first.body;
+    if (first.kind === "timeout") {
+      // The sidecar is alive but busy (e.g. flushing). Respawning here would
+      // create a second writer on the same state; fail open instead.
+      this.log(`sidecar for ${sessionId} busy; dropping event ${String(name)}`);
+      return {};
+    }
 
-    // Sidecar down: respawn once (single writer, no race) and retry.
+    // Unreachable: respawn once (single writer, no race) and wait for the
+    // replacement to actually serve before retrying — state.json still names
+    // the dead port until the new sidecar rewrites it.
     this.log(`sidecar for ${sessionId} unreachable; respawning`);
-    spawnSidecar(sessionId, dir);
-    const revived = await waitForEndpoint(dir, SPAWN_WAIT_MS);
+    spawnSidecar(sessionId, dir, name === "SessionStart");
+    const revived = await waitForEndpoint(dir, SPAWN_WAIT_MS, endpoint);
     if (revived === null) return {};
     const retry = await forward(revived, event);
-    return retry ?? {};
+    return retry.kind === "ok" ? retry.body : {};
   }
 
   async route(req: IncomingMessage, res: ServerResponse): Promise<void> {

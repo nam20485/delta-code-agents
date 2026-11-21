@@ -160,7 +160,7 @@ cumulative content = streaming.
 | `StopFailure` | `state_update idle` + short agent_message note with error kind |
 | `SubagentStart` / events carrying `agent_id` | child thread: `thread create --parent --shared-worktrees --external-id <session_id>:<agent_id> --name <agent_type>`; subsequent events with that `agent_id` append to the child reference |
 | `SubagentStop` | child final `agent_message` (from `last_assistant_message` / `agent_transcript_path`) + idle |
-| `SessionEnd` | flush outbox (`append --acknowledge local` if needed), `state_update idle` safety, TERM mount + watch, final state — except `reason=clear`, which is a conversation reset, not a session exit (see `SessionStart`) |
+| `SessionEnd` | flush outbox (`append --acknowledge local` if needed), `state_update idle` safety, TERM mount + watch, final state — except `reason=clear`, which is a conversation reset, not a session exit: no teardown, the conversation continues in the same thread (per-clear thread splitting via an external-id suffix is deferred to M4) |
 | `PreCompact`/`PostCompact` | no Delta record in v1 (no `agent_thought`, see Decisions); `PostCompact.compact_summary` kept in state for future use |
 
 **Streaming ordering rules.** A tool-using turn produces multiple messages,
@@ -189,9 +189,19 @@ Qwen edits the user's own checkout, so the thread must adopt it — a fresh
    edits with the `tool_use_id` used in the records (delta-claude's
    `hooks/recording/edit-capture.ts` is the reference).
 
+   **Observed on delta 0.28.4 (live probe):** `thread capture` rejects every
+   source except `claude-code` (`invalid_identity`, "capture supports only
+   the claude-code source"), and error JSON arrives pretty-printed across
+   multiple lines. The sidecar parses multi-line error objects, disables
+   capture for the session on that error, and warns in the share output;
+   edits then reach the thread unattributed. Revisit when Delta opens capture
+   to other sources.
+
 Non-Git cwd: record conversation only, note the limitation in status. A cwd
 that is already a Delta-managed worktree (e.g. under `.delta/worktrees/`):
-reuse its worktree reference instead of creating one.
+reuse its worktree reference instead of creating one — deferred to M4
+hardening (M2 always creates; a deferral note lives here per the plan-first
+rule).
 
 ### Outbox and recovery (per Delta docs)
 
@@ -203,7 +213,9 @@ reuse its worktree reference instead of creating one.
 - Offline: `thread create --organization <id> --visibility private` (returns
   without network; upload happens in background), then `append --acknowledge
   local` (from `/delta-setup` policy); surface `upload.state`/`reload_required`
-  in `/delta-inbox` and status. On `reload_required`, pause recording and
+  in `/delta-inbox` and status. M2 simplification: the outbox always
+  acknowledges locally and relies on the 5s flush retry; policy-gated
+  acknowledgment lands with M4. On `reload_required`, pause recording and
   print the remediation: open the thread in the Delta app → **Fork & Restore**
   or **Discard Changes**, or `delta thread fork` + `delta thread discard
   --force`.
