@@ -50,3 +50,10 @@ test("parseFirstJson skips non-JSON lines", () => {
   assert.deepEqual(parseFirstJson<{ a: number }>("noise\n{\"a\":1}\n"), { a: 1 });
   assert.equal(parseFirstJson<object>("no json at all"), null);
 });
+
+test("parseFirstJson handles pretty-printed multi-line errors", () => {
+  const pretty = 'delta: capture supports only the claude-code source\n{\n  "error": {\n    "code": "invalid_reference",\n    "reason": "invalid_identity",\n    "message": "capture supports only the claude-code source",\n    "retryable": false\n  }\n}\n';
+  const parsed = parseFirstJson<Record<string, unknown>>(pretty);
+  assert.notEqual(parsed, null);
+  assert.equal((parsed!["error"] as Record<string, unknown>)["reason"], "invalid_identity");
+});
