@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { atomicWriteFile } from "../lib/fsx.js";
 import { runDeltaJsonl, type DeltaError } from "../delta-cli.js";
 import { wrap } from "../records.js";
@@ -24,6 +24,9 @@ export interface FlushOutcome {
   superseded: boolean;
   reloadRequired: boolean;
   error: DeltaError | null;
+  /** Convenience view of `error` for retry scheduling. */
+  retryable: boolean;
+  retryAfterMs: number | null;
 }
 
 export interface FlushTarget {
@@ -68,9 +71,18 @@ export class Outbox {
     return this.pending.length;
   }
 
+  /** Highest pending sequence (0 when empty) — used to clamp counters. */
+  maxPendingSequence(): number {
+    let max = 0;
+    for (const line of this.pending) if (line.sequence > max) max = line.sequence;
+    return max;
+  }
+
   add(line: OutboxLine): void {
     this.pending.push(line);
-    atomicWriteFile(this.file, this.serialize());
+    // Line append: a crash mid-write leaves one torn line, which load()
+    // drops; the record's sequence is still consumed via the load-time clamp.
+    appendFileSync(this.file, `${JSON.stringify(line)}\n`, { mode: 0o600 });
   }
 
   private serialize(): string {
@@ -85,7 +97,7 @@ export class Outbox {
   /** Send every pending record in one `thread append` batch. */
   async flush(target: FlushTarget): Promise<FlushOutcome> {
     if (this.pending.length === 0) {
-      return { delivered: 0, superseded: false, reloadRequired: false, error: null };
+      return { delivered: 0, superseded: false, reloadRequired: false, error: null, retryable: false, retryAfterMs: null };
     }
     const input = this.pending
       .map((line) => JSON.stringify(wrap(line.sequence, line.update, line.turnSequence)))
@@ -108,7 +120,15 @@ export class Outbox {
     );
     if (!result.ok) {
       const reload = result.error.reason === "reload_required";
-      return { delivered: 0, superseded: false, reloadRequired: reload, error: result.error };
+      return {
+        delivered: 0,
+        superseded: false,
+        reloadRequired: reload,
+        error: result.error,
+        retryable: result.error.retryable === true,
+        retryAfterMs:
+          typeof result.error.retry_after_ms === "number" ? result.error.retry_after_ms : null,
+      };
     }
     const receipts = new Map<number, Disposition>();
     for (const line of result.value.lines) {
@@ -136,6 +156,6 @@ export class Outbox {
     }
     this.pending = kept;
     this.persist();
-    return { delivered, superseded, reloadRequired: false, error: null };
+    return { delivered, superseded, reloadRequired: false, error: null, retryable: false, retryAfterMs: null };
   }
 }

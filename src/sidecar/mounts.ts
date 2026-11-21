@@ -2,6 +2,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { DELTA_SOURCE, EDIT_TOOLS } from "../lib/constants.js";
 import { resolveDeltaBinary, runDelta } from "../delta-cli.js";
 
+// `run_shell_command` stays in EDIT_TOOLS: shell commands edit files too, and
+// unattributed edits are worse than two extra (session-gated) CLI spawns.
+
 export interface AdoptResult {
   ok: boolean;
   reference?: string;
@@ -37,10 +40,23 @@ export class Mounts {
       externalId: string;
       sessionId: string;
       ownerPid: () => number | null;
+      captureEnabled: () => boolean;
       log: (line: string) => void;
       onCaptureUnavailable: () => void;
     },
   ) {}
+
+  get hasChildren(): boolean {
+    return this.children.length > 0;
+  }
+
+  /** Restart the mount children for an already-adopted checkout (after a
+   * sidecar restart) using the persisted worktree reference. */
+  restore(reference: string, cwd: string): void {
+    this.spawnDelta("worktree-mount", ["worktree", "mount", reference, cwd, "--existing-checkout"]);
+    this.spawnDelta("thread-mount", ["thread", "mount", "--owner", this.opts.sessionId, this.opts.threadId]);
+    this.opts.log(`restored mounts for ${reference}`);
+  }
 
   private spawnDelta(label: string, args: string[]): ChildProcess | null {
     const bin = resolveDeltaBinary();
@@ -91,11 +107,14 @@ export class Mounts {
 
   captureStart(toolCallId: string, toolName: string): void {
     if (!EDIT_TOOLS.has(toolName)) return;
+    // Session-wide disable (e.g. this CLI only attributes claude-code).
+    if (!this.opts.captureEnabled()) return;
     void this.runCapture("start", toolCallId);
   }
 
   captureStop(toolCallId: string, toolName: string): void {
     if (!EDIT_TOOLS.has(toolName)) return;
+    if (!this.opts.captureEnabled()) return;
     void this.runCapture("stop", toolCallId);
   }
 

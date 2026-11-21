@@ -124,6 +124,8 @@ export class Sidecar {
   private outbox: Outbox | null = null;
   private recorder: Recorder | null = null;
   private mounts: Mounts | null = null;
+  private shareInFlight: Promise<ShareResponse> | null = null;
+  private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
   constructor(state: SessionState, dir: string) {
     this.state = state;
@@ -167,6 +169,7 @@ export class Sidecar {
         externalId: this.state.external_id,
         sessionId: this.state.session_id,
         ownerPid: () => this.state.qwen_pid,
+        captureEnabled: () => this.state.recording?.capture_enabled !== false,
         log: (line) => this.log(line),
         onCaptureUnavailable: () => {
           if (this.state.recording !== undefined) {
@@ -185,6 +188,15 @@ export class Sidecar {
         log: (line) => this.log(line),
         save: () => this.save(),
       });
+      // A restart with recording already enabled must bring the checkout
+      // mounts back: conversation without file sync is silent degradation.
+      if (
+        typeof recording.worktree_reference === "string" &&
+        this.state.cwd.length > 0 &&
+        !this.mounts.hasChildren
+      ) {
+        void this.mounts.restore(recording.worktree_reference, this.state.cwd);
+      }
       this.flushTimer = setInterval(() => {
         void this.tryFlush();
       }, FLUSH_RETRY_MS);
@@ -205,22 +217,47 @@ export class Sidecar {
 
   private async tryFlush(): Promise<void> {
     const recorder = this.ensureRecorder();
-    if (recorder === null) return;
+    if (recorder === null || this.outbox === null) return;
+    // Retry policy (plan): retry only when `error.retryable`, honoring
+    // `retry_after_ms`; after a non-retryable error, wait for new records.
+    const err = this.lastFlushError;
+    if (err !== null) {
+      if (!err.retryable && this.outbox.size === err.size) return;
+      if (err.retryable && Date.now() - err.at < Math.max(err.retryAfterMs, 250)) return;
+    }
     const outcome = await recorder.finish(this.flushTarget());
+    if (outcome.error !== null) {
+      this.lastFlushError = {
+        retryable: outcome.retryable,
+        retryAfterMs: outcome.retryAfterMs ?? 0,
+        at: Date.now(),
+        size: this.outbox.size,
+      };
+    } else {
+      this.lastFlushError = null;
+    }
     if (outcome.superseded && this.state.recording !== undefined) {
       this.state.recording.superseded = true;
       this.save();
-      this.log("superseded by a teammate; recording of turn content stops");
+      this.log("superseded by a teammate; recording of new turn content stops");
     }
     if (outcome.reloadRequired && this.state.recording !== undefined) {
       this.state.recording.paused = true;
       this.save();
-      this.log("reload_required; recording paused");
+      this.log("reload_required; recording paused (resolve the thread in Delta)");
     }
   }
 
   /** CLI-driven share flow (`cli.ts share [--confirm]`). */
-  async share(confirm: boolean): Promise<ShareResponse> {
+  share(confirm: boolean): Promise<ShareResponse> {
+    if (this.shareInFlight !== null) return this.shareInFlight;
+    this.shareInFlight = this.doShare(confirm).finally(() => {
+      this.shareInFlight = null;
+    });
+    return this.shareInFlight;
+  }
+
+  private async doShare(confirm: boolean): Promise<ShareResponse> {
     const recording = this.recordingState();
     if (recording.consent !== "granted") {
       if (!confirm) {
@@ -301,7 +338,12 @@ export class Sidecar {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        sendJson(res, 200, await this.handleEvent(event));
+        const deferred: (() => void)[] = [];
+        const response = await this.handleEvent(event, (fn) => deferred.push(fn));
+        sendJson(res, 200, response);
+        res.on("finish", () => {
+          for (const fn of deferred) fn();
+        });
         return;
       }
       if (req.method === "POST" && url === "/share") {
@@ -330,7 +372,10 @@ export class Sidecar {
     }
   }
 
-  async handleEvent(event: HookEventPayload): Promise<HookResponse> {
+  async handleEvent(
+    event: HookEventPayload,
+    defer?: (fn: () => void) => void,
+  ): Promise<HookResponse> {
     const pidHint = event["delta_qwen_pid"];
     // SessionStart carries a fresh owner pid (http-delivered events cannot
     // walk the process tree), including on resume with a new qwen process.
@@ -360,12 +405,28 @@ export class Sidecar {
     const recorder = this.ensureRecorder();
     if (recorder !== null) {
       recorder.record(event as Record<string, unknown>);
-      if (name === "Stop" || name === "StopFailure" || name === "SessionEnd") {
-        await this.tryFlush();
-      }
+    }
+    // Response first, side effects after: the router treats a slow or reset
+    // response as a dead sidecar and would spawn a second writer. Flushing
+    // and shutdown run after the response is written (defer), retried by the
+    // flush timer if the client is already gone.
+    if (name === "Stop" || name === "StopFailure") {
+      if (defer !== undefined) defer(() => void this.tryFlush());
+      else void this.tryFlush();
     }
     if (name === "SessionEnd") {
-      await this.shutdown("session end");
+      if (event["reason"] === "clear") {
+        // `/clear` is a conversation reset, not a session exit: no teardown.
+        // (Per-clear thread splitting via an external-id suffix lands in M4.)
+        if (defer !== undefined) defer(() => void this.tryFlush());
+        else void this.tryFlush();
+        return {};
+      }
+      if (defer !== undefined) {
+        defer(() => void this.shutdown("session end"));
+      } else {
+        void this.shutdown("session end");
+      }
     }
     return {};
   }
@@ -398,23 +459,27 @@ export class Sidecar {
     } catch {
       // Best effort.
     }
-    // Keep the session dir while records are still pending, so a resumed
-    // session can drain them; fully-drained sessions clean up immediately.
-    if (pending === 0) {
+    // Recording sessions retain their dir: the outbox may hold undelivered
+    // records, and a later /resume must continue the same thread's sequence
+    // counters (never restart from 1). cleanupStaleSessions reaps them after
+    // a long grace once the outbox is drained.
+    if (this.state.recording?.enabled === true) {
+      this.log(`retaining recording session dir (pending ${pending})`);
+    } else {
       try {
         rmSync(this.dir, { recursive: true, force: true });
       } catch {
         // Best effort; stale-session cleanup removes it later.
       }
-    } else {
-      this.log(`retaining session dir with ${pending} pending records`);
     }
     process.exit(0);
   }
 }
 
 /** Remove dead sessions' state. Called on sidecar start ("a new session that
- * finds a stale state dir cleans it up after the same liveness check"). */
+ * finds a stale state dir cleans it up after the same liveness check"). Dirs
+ * with undelivered records are never deleted; ended recording sessions get a
+ * long grace so a `/resume` can continue the sequence counters. */
 function cleanupStaleSessions(currentSessionId: string): void {
   let entries;
   try {
@@ -432,6 +497,8 @@ function cleanupStaleSessions(currentSessionId: string): void {
     } catch {
       continue;
     }
+    // Undelivered records outrank every grace period.
+    if (new Outbox(join(dir, "outbox.jsonl")).size > 0) continue;
     const state = loadState(dir);
     if (state === null) {
       if (ageMs > 24 * 60 * 60_000) {
@@ -443,8 +510,10 @@ function cleanupStaleSessions(currentSessionId: string): void {
       }
       continue;
     }
+    const recordingGrace =
+      state.recording?.enabled === true ? 24 * 60 * 60_000 : ENDED_GRACE_MS;
     if (state.ended_at !== undefined) {
-      if (ageMs > ENDED_GRACE_MS) {
+      if (ageMs > recordingGrace) {
         try {
           rmSync(dir, { recursive: true, force: true });
         } catch {
@@ -471,8 +540,13 @@ export async function startSidecar(sessionId: string): Promise<void> {
   const dir = sessionDir(sessionId);
   ensureDir(dir);
   let state = loadState(dir);
-  if (state === null || state.ended_at !== undefined || state.session_id !== sessionId) {
+  if (state === null || state.session_id !== sessionId) {
     state = newState(sessionId);
+  } else {
+    // Resume, never reset: an ended session with recording enabled carries
+    // thread identity, sequence counters, consent, and possibly an undrained
+    // outbox — all of which must survive `/resume` and sidecar restarts.
+    delete state.ended_at;
   }
   saveState(dir, state);
   const sidecar = new Sidecar(state, dir);

@@ -35,6 +35,16 @@ export interface RecordingState {
   /** Capture disabled when the CLI rejects our source. */
   capture_enabled: boolean;
   titled: boolean;
+  /** Open turn, persisted so a sidecar restart mid-turn keeps its
+   * turnSequence and last-message tracking (late output keeps its original
+   * turnSequence after supersession or restart). */
+  turn_state?: TurnStateInfo;
+}
+
+export interface TurnStateInfo {
+  turnSequence: number;
+  lastMessageId: string | null;
+  lastMessageFinal: boolean;
 }
 
 export function newState(sessionId: string): SessionState {

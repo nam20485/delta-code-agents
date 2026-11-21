@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { REQUIRED_CONTRACT, resolveDeltaBinary, threadContract } from "./delta-cli.js";
 import { readJson } from "./lib/fsx.js";
@@ -32,6 +32,7 @@ interface SessionStateSummary {
 /** Find the newest live session sidecar whose cwd matches `cwd`. */
 function findSessionByCwd(cwd: string): SessionStateSummary | null {
   const root = sessionsRoot();
+  const realCwd = realpathOrNull(cwd) ?? cwd;
   let best: SessionStateSummary | null = null;
   let bestUpdated = "";
   try {
@@ -40,7 +41,8 @@ function findSessionByCwd(cwd: string): SessionStateSummary | null {
       const state = readJson<SessionStateSummary>(join(root, entry.name, "state.json"));
       if (state === null) continue;
       if (state["ended_at"] !== undefined) continue;
-      if (state["cwd"] !== cwd) continue;
+      const stateCwd = typeof state["cwd"] === "string" ? state["cwd"] : "";
+      if (stateCwd !== cwd && (realpathOrNull(stateCwd) ?? stateCwd) !== realCwd) continue;
       const updated = typeof state["updated_at"] === "string" ? state["updated_at"] : "";
       if (updated >= bestUpdated) {
         best = state;
@@ -51,6 +53,14 @@ function findSessionByCwd(cwd: string): SessionStateSummary | null {
     return null;
   }
   return best;
+}
+
+function realpathOrNull(path: string): string | null {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
 }
 
 interface ShareResponse {

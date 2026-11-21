@@ -42,11 +42,38 @@ function readSidecarEndpoint(dir: string): SidecarEndpoint | null {
   return { port, token };
 }
 
-async function waitForEndpoint(dir: string, timeoutMs: number): Promise<SidecarEndpoint | null> {
+async function endpointAlive(endpoint: SidecarEndpoint): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${endpoint.port}/health`, {
+      headers: { authorization: `Bearer ${endpoint.token}` },
+      signal: AbortSignal.timeout(300),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait for a *serving* sidecar endpoint in `state.json` — not just a present
+ * one: a dead sidecar's stale port lingers in the file until its replacement
+ * rewrites it, and forwarding to it would only fail again.
+ */
+async function waitForEndpoint(
+  dir: string,
+  timeoutMs: number,
+  dead?: SidecarEndpoint,
+): Promise<SidecarEndpoint | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const endpoint = readSidecarEndpoint(dir);
-    if (endpoint !== null) return endpoint;
+    if (
+      endpoint !== null &&
+      (dead === undefined || endpoint.port !== dead.port) &&
+      (await endpointAlive(endpoint))
+    ) {
+      return endpoint;
+    }
     if (Date.now() >= deadline) return null;
     await delay(POLL_MS);
   }
@@ -81,8 +108,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** POST the event to the session sidecar; null on any failure (fail open). */
-async function forward(endpoint: SidecarEndpoint, event: Record<string, unknown>): Promise<unknown | null> {
+type ForwardKind = "ok" | "timeout" | "unreachable";
+
+/** POST the event to the session sidecar. `timeout` means the sidecar is
+ * alive but busy (do NOT respawn it); `unreachable` means it is gone. */
+async function forward(
+  endpoint: SidecarEndpoint,
+  event: Record<string, unknown>,
+): Promise<{ kind: ForwardKind; body: unknown }> {
   try {
     const res = await fetch(`http://127.0.0.1:${endpoint.port}/event`, {
       method: "POST",
@@ -93,12 +126,23 @@ async function forward(endpoint: SidecarEndpoint, event: Record<string, unknown>
       body: JSON.stringify(event),
       signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { kind: "ok", body: {} };
     const text = await res.text();
-    if (text.trim().length === 0) return {};
-    return JSON.parse(text) as unknown;
-  } catch {
-    return null;
+    if (text.trim().length === 0) return { kind: "ok", body: {} };
+    try {
+      return { kind: "ok", body: JSON.parse(text) as unknown };
+    } catch {
+      return { kind: "ok", body: {} };
+    }
+  } catch (err) {
+    const code =
+      typeof err === "object" && err !== null && "cause" in err
+        ? String((err as { cause?: unknown }).cause)
+        : "";
+    return {
+      kind: err instanceof Error && err.name === "TimeoutError" ? "timeout" : code.includes("ECONNREFUSED") ? "unreachable" : "timeout",
+      body: {},
+    };
   }
 }
 
@@ -144,15 +188,23 @@ export class Router {
     }
 
     const first = await forward(endpoint, event);
-    if (first !== null) return first;
+    if (first.kind === "ok") return first.body;
+    if (first.kind === "timeout") {
+      // The sidecar is alive but busy (e.g. flushing). Respawning here would
+      // create a second writer on the same state; fail open instead.
+      this.log(`sidecar for ${sessionId} busy; dropping event ${String(name)}`);
+      return {};
+    }
 
-    // Sidecar down: respawn once (single writer, no race) and retry.
+    // Unreachable: respawn once (single writer, no race) and wait for the
+    // replacement to actually serve before retrying — state.json still names
+    // the dead port until the new sidecar rewrites it.
     this.log(`sidecar for ${sessionId} unreachable; respawning`);
     spawnSidecar(sessionId, dir);
-    const revived = await waitForEndpoint(dir, SPAWN_WAIT_MS);
+    const revived = await waitForEndpoint(dir, SPAWN_WAIT_MS, endpoint);
     if (revived === null) return {};
     const retry = await forward(revived, event);
-    return retry ?? {};
+    return retry.kind === "ok" ? retry.body : {};
   }
 
   async route(req: IncomingMessage, res: ServerResponse): Promise<void> {

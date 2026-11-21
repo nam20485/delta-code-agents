@@ -9,20 +9,6 @@ import {
 } from "../records.js";
 import type { FlushOutcome, FlushTarget, OutboxLine } from "./outbox.js";
 import type { RecordingState } from "./state.js";
-
-interface MessageProgress {
-  text: string;
-  final: boolean;
-}
-
-interface TurnInfo {
-  turnSequence: number;
-  /** Last streamed message id and whether its `is_final` arrived. */
-  lastMessageId: string | null;
-  lastMessageFinal: boolean;
-  seenPromptIds: Set<string>;
-}
-
 export interface RecorderDeps {
   /** Outbox or an in-memory sink with the same shape (tests). */
   outbox: OutboxLike;
@@ -41,7 +27,20 @@ export interface RecorderDeps {
 export interface OutboxLike {
   add(line: OutboxLine): void;
   readonly size: number;
+  maxPendingSequence(): number;
   flush(target: FlushTarget): Promise<FlushOutcome>;
+}
+
+interface MessageProgress {
+  text: string;
+  final: boolean;
+}
+
+interface TurnInfo {
+  turnSequence: number;
+  /** Last streamed message id and whether its `is_final` arrived. */
+  lastMessageId: string | null;
+  lastMessageFinal: boolean;
 }
 
 /**
@@ -49,58 +48,85 @@ export interface OutboxLike {
  * mapping. Ordering rules from the Qwen docs: once a `message_id` is final,
  * later (stale) posts are ignored; before final, only longer cumulative text
  * is re-sent; `Stop`'s fallback reuses the turn's last `message_id`.
+ *
+ * After supersession (a `fenced` receipt), no *new* turn content is started
+ * (no prompts, no new tool calls), but late streamed finals and tool
+ * completions for the open turn are still recorded — with their original
+ * `turnSequence`, per the plugin guide.
  */
 export class Recorder {
   private readonly deps: RecorderDeps;
-  private turn: TurnInfo | null = null;
+  private turn: TurnInfo | null;
   private readonly messages = new Map<string, MessageProgress>();
   private readonly seenPrompts = new Set<string>();
   private flushing: Promise<FlushOutcome> | null = null;
 
   constructor(deps: RecorderDeps) {
     this.deps = deps;
+    // Resume an open turn after a sidecar restart (turnSequence continuity).
+    this.turn =
+      deps.recording.turn_state !== undefined
+        ? { ...deps.recording.turn_state }
+        : null;
+    // Clamp the counter above anything already persisted in the outbox, so a
+    // crash between the two writes can never reuse a sequence.
+    const floor = deps.outbox.maxPendingSequence() + 1;
+    if (deps.recording.next_sequence < floor) {
+      deps.recording.next_sequence = floor;
+      deps.save();
+    }
   }
 
   get enabled(): boolean {
     return this.deps.recording.enabled && !this.deps.recording.paused;
   }
 
-  private allocate(): number {
+  /**
+   * Persist the record line first, then the counter: a crash in between
+   * leaves a persisted record whose sequence the constructor's clamp will
+   * consume, never a reused or missing sequence.
+   */
+  private emit(update: AcpUpdate, turnSequence?: number): number {
     const sequence = this.deps.recording.next_sequence;
+    const line: OutboxLine = { sequence, update };
+    if (turnSequence !== undefined) line.turnSequence = turnSequence;
+    this.deps.outbox.add(line);
     this.deps.recording.next_sequence = sequence + 1;
     this.deps.save();
     return sequence;
   }
 
-  private emit(update: AcpUpdate, turnSequence?: number): void {
-    const sequence = this.allocate();
-    const line: OutboxLine = { sequence, update };
-    if (turnSequence !== undefined) line.turnSequence = turnSequence;
-    this.deps.outbox.add(line);
+  private persistTurn(): void {
+    if (this.turn === null) {
+      delete this.deps.recording.turn_state;
+    } else {
+      this.deps.recording.turn_state = { ...this.turn };
+    }
+    this.deps.save();
   }
 
   private openTurn(): number {
     if (this.turn !== null) return this.turn.turnSequence;
     // The running update's turnSequence equals its own sequence (guide rule).
-    const sequence = this.allocate();
-    this.deps.outbox.add({
-      sequence,
-      turnSequence: sequence,
-      update: stateUpdate("running"),
-    });
+    // emit() takes the sequence from the same counter, so the pre-read value
+    // and the assigned sequence are identical by construction.
+    const turnSequence = this.deps.recording.next_sequence;
+    this.emit(stateUpdate("running"), turnSequence);
     this.turn = {
-      turnSequence: sequence,
+      turnSequence,
       lastMessageId: null,
       lastMessageFinal: false,
-      seenPromptIds: new Set<string>(),
     };
-    return sequence;
+    this.persistTurn();
+    return turnSequence;
   }
 
   private closeTurn(): void {
     if (this.turn === null) return;
     this.emit(stateUpdate("idle"), this.turn.turnSequence);
     this.turn = null;
+    this.messages.clear();
+    this.persistTurn();
   }
 
   private str(value: unknown): string | null {
@@ -144,15 +170,23 @@ export class Recorder {
   }
 
   private onPrompt(event: Record<string, unknown>): void {
+    // Superseded: no new turns or user prompts.
+    if (this.deps.recording.superseded) return;
     const submitted = this.str(event["submitted_prompt"]);
     if (submitted === null || submitted.trim().length === 0) return;
-    const promptId = this.str(event["prompt_id"]) ?? `hash:${submitted}`;
-    if (this.seenPrompts.has(promptId)) return;
-    this.seenPrompts.add(promptId);
+    const promptId = this.str(event["prompt_id"]);
+    if (promptId !== null) {
+      // Dedupe is keyed on the real prompt id only; without one, identical
+      // prompts are separate submissions and get distinct sequence ids.
+      if (this.seenPrompts.has(promptId)) return;
+      this.seenPrompts.add(promptId);
+    }
     if (this.turn === null) this.openTurn();
     const turn = this.turn!;
-    turn.seenPromptIds.add(promptId);
-    this.emit(userMessage(`u-${promptId}`, submitted), turn.turnSequence);
+    // Without a prompt_id the id falls back to the sequence (unique, never
+    // reused), so identical prompts still record as separate submissions.
+    const messageId = promptId !== null ? `u-${promptId}` : `u-s${this.deps.recording.next_sequence}`;
+    this.emit(userMessage(messageId, submitted), turn.turnSequence);
     if (!this.deps.recording.titled) {
       this.deps.recording.titled = true;
       this.emit(sessionInfoUpdate(submitted.split("\n")[0] ?? submitted));
@@ -160,20 +194,29 @@ export class Recorder {
   }
 
   private onMessageDisplay(event: Record<string, unknown>): void {
-    if (this.turn === null) return;
     const messageId = this.str(event["message_id"]);
     const text = this.str(event["displayed_text"]);
     if (messageId === null || text === null) return;
     const isFinal = event["is_final"] === true;
+    if (this.turn === null) {
+      // Late finals after a restart (or a dropped prompt) still belong to a
+      // turn Delta sees as running; non-final partials without a turn are
+      // stale deliveries and are ignored.
+      if (!isFinal) return;
+      if (this.deps.recording.superseded) return;
+      this.openTurn();
+    }
+    const turn = this.turn!;
     const progress = this.messages.get(messageId);
     if (progress !== undefined) {
       if (progress.final) return; // stale delivery after the final one
       if (text.length <= progress.text.length && !isFinal) return;
     }
     this.messages.set(messageId, { text, final: isFinal });
-    this.turn.lastMessageId = messageId;
-    this.turn.lastMessageFinal = isFinal;
-    this.emit(agentMessage(`a-${messageId}`, text), this.turn.turnSequence);
+    turn.lastMessageId = messageId;
+    turn.lastMessageFinal = isFinal;
+    this.emit(agentMessage(`a-${messageId}`, text), turn.turnSequence);
+    this.persistTurn();
   }
 
   private toolCallId(event: Record<string, unknown>): string | null {
@@ -182,7 +225,9 @@ export class Recorder {
   }
 
   private onPreToolUse(event: Record<string, unknown>): void {
-    this.openTurn();
+    // Superseded: no new tool-call records (the M3 deny gate goes here too).
+    if (this.deps.recording.superseded) return;
+    if (this.turn === null) this.openTurn();
     const id = this.toolCallId(event);
     const toolName = this.str(event["tool_name"]);
     if (id === null || toolName === null) return;
@@ -221,9 +266,12 @@ export class Recorder {
     const turn = this.turn;
     if (failure) {
       const kind = this.str(event["error"]) ?? "unknown";
-      const messageId =
-        turn.lastMessageId !== null ? `a-${turn.lastMessageId}` : `a-error-${turn.turnSequence}`;
-      this.emit(agentMessage(messageId, `Turn ended by an API error (${kind}).`), turn.turnSequence);
+      // A distinct id: reusing the last streamed messageId would REPLACE the
+      // partial answer in Delta (same-id resends are cumulative updates).
+      this.emit(
+        agentMessage(`a-error-${turn.turnSequence}`, `Turn ended by an API error (${kind}).`),
+        turn.turnSequence,
+      );
     } else {
       const last = this.str(event["last_assistant_message"]);
       if (
@@ -256,3 +304,4 @@ export class Recorder {
 }
 
 export type { DeltaRecord };
+
