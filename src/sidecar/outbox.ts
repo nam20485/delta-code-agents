@@ -34,6 +34,8 @@ export interface FlushTarget {
   source: string;
   externalId: string;
   producerName: string;
+  /** When to report receipts; defaults to local (offline-safe). */
+  acknowledge?: "local" | "server";
 }
 
 /**
@@ -124,7 +126,7 @@ export class Outbox {
         "--producer-name",
         target.producerName,
         "--acknowledge",
-        "local",
+        target.acknowledge ?? "local",
       ],
       { input: `${input}\n`, timeoutMs: 20_000 },
     );

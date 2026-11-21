@@ -29,10 +29,18 @@ function str(value: unknown): string {
  * is remote activity for the inbox.
  */
 export class WatchView {
+  /** Subagents/subthreads reported by the watch (children/child frames). */
+  private readonly childThreads = new Map<string, Record<string, unknown>>();
+
   constructor(
     private readonly inbox: Inbox,
     private readonly effects: WatchEffects,
   ) {}
+
+  /** Current child threads keyed by thread_id (for status/diagnostics). */
+  children(): Record<string, unknown>[] {
+    return [...this.childThreads.values()];
+  }
 
   apply(frame: Record<string, unknown>): void {
     const type = str(frame["type"]);
@@ -90,11 +98,38 @@ export class WatchView {
         return;
       case "turn":
       case "presence":
-      case "children":
-      case "child":
-      case "child.remove":
-        // Turn/presence replace latest state; children tracking lands in M5.
+        // Turn/presence replace latest state; not needed for recording.
         return;
+      case "children": {
+        const list = frame["children"];
+        if (Array.isArray(list)) {
+          // Only a usable snapshot replaces the map; an off-contract frame
+          // (null/non-array) must not wipe tracked subthreads.
+          this.childThreads.clear();
+          for (const entry of list) {
+            if (entry !== null && typeof entry === "object") {
+              const child = entry as Record<string, unknown>;
+              const id = str(child["thread_id"]);
+              if (id.length > 0) this.childThreads.set(id, child);
+            }
+          }
+        }
+        return;
+      }
+      case "child": {
+        const child = frame["child"];
+        if (child !== null && typeof child === "object") {
+          const entry = child as Record<string, unknown>;
+          const id = str(entry["thread_id"]);
+          if (id.length > 0) this.childThreads.set(id, entry);
+        }
+        return;
+      }
+      case "child.remove": {
+        const id = str(frame["thread_id"]);
+        if (id.length > 0) this.childThreads.delete(id);
+        return;
+      }
       default:
         // Forward-extensible: skip unknown frame types.
         return;
