@@ -578,6 +578,9 @@ export class Sidecar {
     this.recorder = null;
     this.outbox = null;
     this.inbox = null;
+    // Pre-clear buffered events belong to the cleared conversation; drop them
+    // so the chained enable's drain cannot replay them into the new thread.
+    this.eventBuffer = [];
     delete this.state.recording;
     this.save();
     this.log(`clear: new conversation external id ${this.state.external_id}`);
@@ -913,6 +916,15 @@ export class Sidecar {
     if (this.ownerTimer !== null) clearInterval(this.ownerTimer);
     if (this.flushTimer !== null) clearInterval(this.flushTimer);
     this.log(`shutdown: ${reason}`);
+    // If an enable is still in flight (e.g. a one-shot qwen -p whose whole
+    // session lives inside the enable window), let it finish so the transcript
+    // is recorded before teardown, bounded so a hung enable cannot block exit.
+    if (this.enableInFlight !== null) {
+      await Promise.race([
+        this.enableInFlight.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 30_000).unref()),
+      ]);
+    }
     // Final flush before tearing down mounts, bounded by the delta timeout.
     // Force it: the retry guards (backoff / non-retryable-without-new-
     // records) must not let the sidecar exit without a last delivery try.
