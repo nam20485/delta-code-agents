@@ -682,6 +682,16 @@ export async function startSidecar(sessionId: string): Promise<void> {
     }
     try {
       writeSync(fd, String(process.pid));
+    } catch {
+      // A failed write must not leave a zero-byte lock that wedges the
+      // session (every later spawn would read empty and exit). Remove our
+      // own just-created lock and let the next re-send acquire cleanly.
+      try {
+        rmSync(lockPath, { force: true });
+      } catch {
+        // Best effort.
+      }
+      return false;
     } finally {
       closeSync(fd);
     }
@@ -700,7 +710,10 @@ export async function startSidecar(sessionId: string): Promise<void> {
     // Unparsable/empty or vanished lock: assume another spawn owns it; never
     // delete a lock we cannot positively identify as stale.
     if (owner === null || pidAlive(owner)) process.exit(0);
-    // Stale lock from a crashed sidecar: reclaim atomically.
+    // Stale lock from a crashed sidecar: reclaim atomically. Re-read right
+    // before deleting so a stalled reclaimer cannot remove a lock that a
+    // winner has since re-acquired with a live pid.
+    if (readOwner() !== owner) process.exit(0);
     try {
       rmSync(lockPath, { force: true });
     } catch {
