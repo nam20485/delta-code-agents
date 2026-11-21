@@ -18,6 +18,7 @@ import { Recorder } from "./recorder.js";
 import { Mounts } from "./mounts.js";
 import { Inbox } from "./inbox.js";
 import { Watcher } from "./watcher.js";
+import { ChildThreads } from "./children.js";
 
 const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const OWNER_POLL_MS = 2_000;
@@ -130,6 +131,7 @@ export class Sidecar {
   private mounts: Mounts | null = null;
   private inbox: Inbox | null = null;
   private watcher: Watcher | null = null;
+  private children: ChildThreads | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
   private enableInFlight: Promise<{ ok: true } | { ok: false; error: string }> | null = null;
@@ -215,6 +217,12 @@ export class Sidecar {
         },
       });
       this.watcher.start();
+      this.children = new ChildThreads({
+        dir: this.dir,
+        parentThreadId: () => this.recordingState().thread_id,
+        externalId: () => this.state.external_id,
+        log: (line) => this.log(line),
+      });
       this.flushTimer = setInterval(() => {
         void this.tryFlush();
       }, FLUSH_RETRY_MS);
@@ -225,11 +233,16 @@ export class Sidecar {
 
   private flushTarget(): FlushTarget {
     const recording = this.recordingState();
+    // Policy-gated acknowledgment: private (offline) mode acks locally so
+    // recording never waits on the network; shared modes ack at the server
+    // for durable receipts.
+    const mode = this.state.cwd.length > 0 ? readPolicy(this.state.cwd).mode : "manual";
     return {
       threadId: recording.thread_id,
       source: DELTA_SOURCE,
       externalId: this.state.external_id,
       producerName: PRODUCER_NAME,
+      acknowledge: mode === "private" ? "local" : "server",
     };
   }
 
@@ -507,6 +520,7 @@ export class Sidecar {
     this.recorder = null;
     this.outbox = null;
     this.inbox = null;
+    this.children = null;
     this.log("recording paused");
     return { status: "shared", thread_id: recording.thread_id, message: "paused; /delta-share resumes in the same thread" };
   }
@@ -578,12 +592,26 @@ export class Sidecar {
     this.recorder = null;
     this.outbox = null;
     this.inbox = null;
+    this.children = null;
     // Pre-clear buffered events belong to the cleared conversation; drop them
     // so the chained enable's drain cannot replay them into the new thread.
     this.eventBuffer = [];
     delete this.state.recording;
     this.save();
     this.log(`clear: new conversation external id ${this.state.external_id}`);
+  }
+
+  private ensureChildren(): ChildThreads | null {
+    if (this.state.recording?.enabled !== true) return null;
+    if (this.children === null) {
+      this.children = new ChildThreads({
+        dir: this.dir,
+        parentThreadId: () => this.recordingState().thread_id,
+        externalId: () => this.state.external_id,
+        log: (line) => this.log(line),
+      });
+    }
+    return this.children;
   }
 
   private ensureMounts(): Mounts {    if (this.mounts === null) {
@@ -840,6 +868,18 @@ export class Sidecar {
       };
     }
 
+    // Subagent events (carrying agent_id) record into child threads, not the
+    // parent recorder. Route them directly (fire-and-forget); before recording
+    // is enabled there is no parent thread, so they are dropped.
+    if (typeof event["agent_id"] === "string") {
+      const children = this.ensureChildren();
+      if (children !== null) {
+        const agentType = typeof event["agent_type"] === "string" ? event["agent_type"] : "subagent";
+        void children.record(event["agent_id"], agentType, event as Record<string, unknown>);
+      }
+      return {};
+    }
+
     // Buffer events that arrive while an enable is in flight (recording not
     // yet enabled); they are replayed once the recorder exists, not dropped.
     // SessionEnd is never buffered: it must always reach teardown even if the
@@ -933,6 +973,12 @@ export class Sidecar {
     } catch {
       // Best effort.
     }
+    // Flush child-thread outboxes too before teardown.
+    try {
+      await this.children?.flushAll();
+    } catch {
+      // Best effort.
+    }
     const pending = this.outbox?.size ?? 0;
     this.watcher?.stop();
     this.mounts?.stopAll();
@@ -986,7 +1032,11 @@ function cleanupStaleSessions(currentSessionId: string): void {
     let outboxBytes = 0;
     try {
       for (const entry of readdirSync(dir)) {
-        if (entry === "outbox.jsonl" || (entry.startsWith("outbox-") && entry.endsWith(".jsonl"))) {
+        if (
+          entry === "outbox.jsonl" ||
+          (entry.startsWith("outbox-") && entry.endsWith(".jsonl")) ||
+          (entry.startsWith("child-") && entry.endsWith(".jsonl"))
+        ) {
           outboxBytes += statSync(join(dir, entry)).size;
         }
       }
