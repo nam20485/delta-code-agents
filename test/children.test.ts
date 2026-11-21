@@ -78,3 +78,26 @@ test("distinct agent ids that sanitize alike get distinct outbox files", async (
   assert.ok(statSync(join(dir, "child-0-a%3Ab.jsonl")).size > 0);
   assert.ok(statSync(join(dir, "child-0-a%2Fb.jsonl")).size > 0);
 });
+
+test("a fenced child persists superseded and a restart refuses new content", async () => {
+  fakeBin();
+  const dir = mkdtempSync(join(tmpdir(), "dq-children-"));
+  // Fence the child's first record (the running state_update at sequence 1).
+  process.env["FAKE_FENCE_SEQ"] = "1";
+  const ct = children(dir);
+  await ct.record("ag1", "Explorer", { hook_event_name: "SubagentStart", agent_id: "ag1", agent_type: "Explorer" });
+  await ct.record("ag1", "Explorer", { hook_event_name: "MessageDisplay", agent_id: "ag1", message_id: "m1", displayed_text: "hi", is_final: true });
+  await ct.record("ag1", "Explorer", { hook_event_name: "SubagentStop", agent_id: "ag1", agent_type: "Explorer", last_assistant_message: "done" });
+  const stateFile = join(dir, "child-0-ag1.state.json");
+  const saved = JSON.parse(readFileSync(stateFile, "utf8")) as { superseded?: boolean };
+  assert.equal(saved.superseded, true);
+
+  // A fresh ChildThreads on the same dir restores the flag and refuses new
+  // turn content (a PreToolUse is gated by superseded).
+  process.env["FAKE_FENCE_SEQ"] = "";
+  const revived = children(dir);
+  const outboxFile = join(dir, "child-0-ag1.jsonl");
+  const before = statSync(outboxFile).size;
+  await revived.record("ag1", "Explorer", { hook_event_name: "PreToolUse", agent_id: "ag1", tool_name: "write_file", tool_use_id: "t9", tool_input: {} });
+  assert.equal(statSync(outboxFile).size, before);
+});
