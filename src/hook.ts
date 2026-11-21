@@ -1,46 +1,21 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { ensureLauncher } from "./lib/launcher.js";
-import { ensureDir, readJson } from "./lib/fsx.js";
-import { findQwenPid, pidAlive } from "./lib/proc.js";
-import { sessionDir } from "./lib/paths.js";
+import { ensureDir } from "./lib/fsx.js";
+import { findQwenPid } from "./lib/proc.js";
+import { deltaRoot } from "./lib/paths.js";
+import { routerPort } from "./router/router.js";
 
-const REQUEST_TIMEOUT_MS = 2_000;
-const SPAWN_WAIT_MS = 2_500;
+const ROUTER_REQUEST_TIMEOUT_MS = 2_000;
+const ROUTER_SPAWN_WAIT_MS = 3_000;
 const HEALTH_POLL_MS = 100;
 const HEALTH_PROBE_TIMEOUT_MS = 500;
 
-interface Endpoint {
-  port: number;
-  token: string;
-  qwenPid: number | null;
-}
-
-interface SessionStateFile {
-  port?: unknown;
-  token?: unknown;
-  qwen_pid?: unknown;
-}
-
-function readEndpoint(dir: string): Endpoint | null {
-  const state = readJson<SessionStateFile>(join(dir, "state.json"));
-  if (state === null) return null;
-  const { port, token } = state;
-  if (typeof port !== "number" || typeof token !== "string" || port <= 0) return null;
-  return {
-    port,
-    token,
-    qwenPid: typeof state.qwen_pid === "number" ? state.qwen_pid : null,
-  };
-}
-
-async function healthy(endpoint: Endpoint): Promise<boolean> {
+async function routerHealthy(): Promise<boolean> {
   try {
-    const res = await fetch(`http://127.0.0.1:${endpoint.port}/health`, {
-      headers: { authorization: `Bearer ${endpoint.token}` },
+    const res = await fetch(`http://127.0.0.1:${routerPort()}/health`, {
       signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
     });
     return res.ok;
@@ -49,12 +24,11 @@ async function healthy(endpoint: Endpoint): Promise<boolean> {
   }
 }
 
-async function waitForHealth(dir: string, timeoutMs: number): Promise<Endpoint | null> {
+async function waitForRouter(timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const endpoint = readEndpoint(dir);
-    if (endpoint !== null && (await healthy(endpoint))) return endpoint;
-    if (Date.now() >= deadline) return null;
+    if (await routerHealthy()) return true;
+    if (Date.now() >= deadline) return false;
     await delay(HEALTH_POLL_MS);
   }
 }
@@ -69,46 +43,33 @@ function tryLock(path: string): boolean {
 }
 
 /**
- * Ensure a healthy sidecar exists for the session. Only `SessionStart`
- * bootstraps a session with no state; any event may restart a down sidecar.
- * Spawning is guarded by an exclusive lock file so parallel hook dispatchers
- * cannot start two sidecars.
+ * Ensure the user-level router is running. Guarded by an exclusive lock so
+ * parallel dispatchers cannot spawn two routers; it is spawned fully detached
+ * (own session, no pipes, unref'd) so nothing in Qwen's lifecycle reaps it.
  */
-async function ensureSidecar(
-  dir: string,
-  sessionId: string,
-  eventName: unknown,
-): Promise<Endpoint | null> {
-  const existing = readEndpoint(dir);
-  if (existing !== null && (await healthy(existing))) return existing;
-  if (existing === null && eventName !== "SessionStart") return null;
-
-  // The sidecar creates its own state dir, but the lock below needs it first.
-  ensureDir(dir);
-  const lockPath = join(dir, "spawn.lock");
+async function ensureRouter(): Promise<boolean> {
+  if (await routerHealthy()) return true;
+  ensureDir(deltaRoot());
+  const lockPath = deltaRoot() + "/router.lock";
   let haveLock = tryLock(lockPath);
   if (!haveLock) {
-    // Another dispatcher is mid-spawn; wait it out instead of racing.
-    const endpoint = await waitForHealth(dir, SPAWN_WAIT_MS);
-    if (endpoint !== null) return endpoint;
+    if (await waitForRouter(ROUTER_SPAWN_WAIT_MS)) return true;
     try {
       unlinkSync(lockPath);
     } catch {
-      return null;
+      return false;
     }
     haveLock = tryLock(lockPath);
-    if (!haveLock) return null;
+    if (!haveLock) return false;
   }
   try {
-    const sidecarJs = fileURLToPath(new URL("./sidecar/server.js", import.meta.url));
-    // Fully detached: new session/process group, no inherited pipes, unref'd —
-    // Qwen's async-hook process-tree reclamation on exit cannot reach it.
-    const child = spawn(process.execPath, [sidecarJs, sessionId], {
+    const routerJs = fileURLToPath(new URL("./router/router.js", import.meta.url));
+    const child = spawn(process.execPath, [routerJs], {
       detached: true,
       stdio: "ignore",
     });
     child.unref();
-    return await waitForHealth(dir, SPAWN_WAIT_MS);
+    return await waitForRouter(ROUTER_SPAWN_WAIT_MS);
   } finally {
     try {
       unlinkSync(lockPath);
@@ -135,11 +96,11 @@ function readStdin(): Promise<string> {
 }
 
 /**
- * Hook dispatcher: forward one Qwen hook event to the session sidecar.
- *
- * Failure policy (plan, "Hook dispatcher"): fail open, always exit 0, never
- * print on failure — exit 2 would block the tool. Only a sidecar response
- * with content (supersession deny, inbox context) is printed.
+ * Hook dispatcher. In production Qwen invokes this only for SessionStart
+ * (every other event is a native http hook straight to the router); manual
+ * invocations with other events are forwarded unchanged. Failure policy:
+ * fail open, always exit 0, never print on failure — exit 2 would block
+ * startup. Only a router response with content is printed.
  */
 async function main(): Promise<number> {
   const raw = await readStdin();
@@ -151,38 +112,29 @@ async function main(): Promise<number> {
   }
   const sessionId = event["session_id"];
   if (typeof sessionId !== "string" || sessionId.length === 0) return 0;
-  let dir: string;
-  try {
-    dir = sessionDir(sessionId);
-  } catch {
-    return 0;
-  }
-  try {
-    ensureLauncher(fileURLToPath(import.meta.url));
-  } catch {
-    // Launcher upkeep is best-effort.
-  }
-  const endpoint = await ensureSidecar(dir, sessionId, event["hook_event_name"]);
-  if (endpoint === null) return 0;
 
-  let qwenPid = endpoint.qwenPid;
-  if (qwenPid === null || !pidAlive(qwenPid)) {
-    qwenPid = findQwenPid(process.pid);
+  if (event["hook_event_name"] === "SessionStart") {
+    // Once per session: refresh the launcher and learn qwen's pid — http
+    // hooks cannot walk the process tree, so this is the only chance.
+    try {
+      ensureLauncher(fileURLToPath(import.meta.url));
+    } catch {
+      // Launcher upkeep is best-effort.
+    }
+    const qwenPid = findQwenPid(process.pid);
+    if (qwenPid !== null) {
+      event = { ...event, delta_qwen_pid: qwenPid };
+    }
+    if (!(await ensureRouter())) return 0;
   }
-  const payload = {
-    ...event,
-    delta_dispatcher_pid: process.pid,
-    delta_qwen_pid: qwenPid,
-  };
+
+  const payload = { ...event, delta_dispatcher_pid: process.pid };
   try {
-    const res = await fetch(`http://127.0.0.1:${endpoint.port}/event`, {
+    const res = await fetch(`http://127.0.0.1:${routerPort()}/event`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${endpoint.token}`,
-      },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(ROUTER_REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) return 0;
     const text = await res.text();
@@ -205,3 +157,4 @@ async function main(): Promise<number> {
 void main()
   .then((code) => process.exit(code))
   .catch(() => process.exit(0));
+

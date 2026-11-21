@@ -4,6 +4,7 @@ import { REQUIRED_CONTRACT, resolveDeltaBinary, threadContract } from "./delta-c
 import { readJson } from "./lib/fsx.js";
 import { sessionsRoot } from "./lib/paths.js";
 import { pidAlive } from "./lib/proc.js";
+import { routerPort } from "./router/router.js";
 
 const USAGE = `delta-qwen CLI
 
@@ -39,6 +40,16 @@ async function doctor(): Promise<number> {
     } else {
       console.log(`thread contract: failed (${result.error.message})`);
     }
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${routerPort()}/health`, {
+      signal: AbortSignal.timeout(500),
+    });
+    console.log(
+      `router: ${res.ok ? `running on port ${routerPort()}` : `unhealthy (HTTP ${res.status})`}`,
+    );
+  } catch {
+    console.log("router: not running (starts with the next Qwen session)");
   }
   console.log(`sessions root: ${sessionsRoot()}`);
   let listed = 0;

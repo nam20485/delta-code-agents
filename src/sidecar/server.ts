@@ -121,7 +121,13 @@ export class Sidecar {
 
   async handleEvent(event: HookEventPayload): Promise<HookResponse> {
     const pidHint = event["delta_qwen_pid"];
-    if (this.state.qwen_pid === null && typeof pidHint === "number") {
+    // SessionStart carries a fresh owner pid (http-delivered events cannot
+    // walk the process tree), including on resume with a new qwen process.
+    if (
+      typeof pidHint === "number" &&
+      this.state.qwen_pid !== pidHint &&
+      (event["hook_event_name"] === "SessionStart" || this.state.qwen_pid === null)
+    ) {
       this.state.qwen_pid = pidHint;
       saveState(this.dir, this.state);
       this.log(`owner pid ${pidHint}`);
