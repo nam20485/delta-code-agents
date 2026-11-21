@@ -21,6 +21,7 @@ function children(dir: string): ChildThreads {
     parentThreadId: () => "fake-thread",
     externalId: () => "sess",
     generation: () => 0,
+    acknowledge: () => "local",
     log: () => {},
   });
 }
@@ -50,6 +51,7 @@ test("no parent thread means subagent events are dropped", async () => {
     parentThreadId: () => "",
     externalId: () => "sess",
     generation: () => 0,
+    acknowledge: () => "local",
     log: () => {},
   });
   await ct.record("ag1", "Explorer", { hook_event_name: "SubagentStart", agent_id: "ag1" });

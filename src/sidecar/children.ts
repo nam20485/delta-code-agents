@@ -4,7 +4,7 @@ import { runDelta } from "../delta-cli.js";
 import { atomicWriteJson, readJson } from "../lib/fsx.js";
 import { Outbox } from "./outbox.js";
 import { Recorder } from "./recorder.js";
-import type { RecordingState } from "./state.js";
+import type { RecordingState, TurnStateInfo } from "./state.js";
 
 interface Child {
   reference: string;
@@ -16,6 +16,7 @@ interface Child {
 
 interface ChildPersisted {
   next_sequence: number;
+  turn_state?: TurnStateInfo;
 }
 
 /** Collision-safe filename component for an agent id (a:b vs a/b differ). */
@@ -45,12 +46,13 @@ export class ChildThreads {
       parentThreadId: () => string;
       externalId: () => string;
       generation: () => number;
+      acknowledge: () => "local" | "server";
       log: (line: string) => void;
     },
   ) {}
 
-  private childFile(agentId: string, suffix: string): string {
-    return join(this.opts.dir, `child-${this.opts.generation()}-${safeName(agentId)}.${suffix}`);
+  private childFile(agentId: string, suffix: string, generation: number): string {
+    return join(this.opts.dir, `child-${generation}-${safeName(agentId)}.${suffix}`);
   }
 
   private async ensureChild(agentId: string, agentType: string): Promise<Child | null> {
@@ -80,6 +82,9 @@ export class ChildThreads {
   }
 
   private async createChild(agentId: string, agentType: string, parent: string): Promise<Child | null> {
+    // Snapshot identity before the await so a /clear mid-create cannot mix an
+    // old parent/external id with new-generation filenames.
+    const generation = this.opts.generation();
     const externalId = `${this.opts.externalId()}:${agentId}`;
     const result = await runDelta<{ reference?: unknown }>([
       "thread",
@@ -94,6 +99,11 @@ export class ChildThreads {
       agentType,
       "--shared-worktrees",
     ]);
+    if (this.opts.generation() !== generation) {
+      // Conversation cleared while creating; this child belongs to the old
+      // generation — drop it rather than write into the new one.
+      return null;
+    }
     if (!result.ok || typeof result.value["reference"] !== "string") {
       this.opts.log(
         `child create failed for ${agentId}: ${result.ok ? "no reference" : result.error.message}`,
@@ -101,7 +111,7 @@ export class ChildThreads {
       return null;
     }
     const reference = result.value["reference"];
-    const stateFile = this.childFile(agentId, "state.json");
+    const stateFile = this.childFile(agentId, "state.json", generation);
     const saved = readJson<ChildPersisted>(stateFile);
     const recording: RecordingState = {
       enabled: true,
@@ -113,14 +123,17 @@ export class ChildThreads {
       capture_enabled: false,
       titled: false,
     };
-    const outbox = new Outbox(this.childFile(agentId, "jsonl"));
+    if (saved?.turn_state !== undefined) recording.turn_state = saved.turn_state;
+    const outbox = new Outbox(this.childFile(agentId, "jsonl", generation));
     const recorder = new Recorder({
       outbox,
       recording,
       capture: { start: () => {}, stop: () => {} },
       log: (line) => this.opts.log(`[${agentId}] ${line}`),
       save: () => {
-        atomicWriteJson(stateFile, { next_sequence: recording.next_sequence });
+        const persisted: ChildPersisted = { next_sequence: recording.next_sequence };
+        if (recording.turn_state !== undefined) persisted.turn_state = recording.turn_state;
+        atomicWriteJson(stateFile, persisted);
       },
     });
     this.opts.log(`child thread ${reference} for ${agentType} (${agentId})`);
@@ -151,7 +164,13 @@ export class ChildThreads {
       source: DELTA_SOURCE,
       externalId: child.externalId,
       producerName: PRODUCER_NAME,
+      acknowledge: this.opts.acknowledge(),
     });
+    // Mirror the parent's handling: stop new content when fenced/superseded,
+    // pause on reload_required so we do not append into a thread Delta wants
+    // reloaded.
+    if (outcome.superseded) child.recording.superseded = true;
+    if (outcome.reloadRequired) child.recording.paused = true;
     if (outcome.error !== null) {
       this.opts.log(`child flush error: ${outcome.error.message}`);
     }

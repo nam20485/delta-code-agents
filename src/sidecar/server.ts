@@ -223,6 +223,7 @@ export class Sidecar {
           parentThreadId: () => this.recordingState().thread_id,
           externalId: () => this.state.external_id,
           generation: () => this.state.generation,
+          acknowledge: () => (this.state.cwd.length > 0 && readPolicy(this.state.cwd).mode === "private" ? "local" : "server"),
           log: (line) => this.log(line),
         });
       }
@@ -623,6 +624,7 @@ export class Sidecar {
         parentThreadId: () => this.recordingState().thread_id,
         externalId: () => this.state.external_id,
         generation: () => this.state.generation,
+        acknowledge: () => (this.state.cwd.length > 0 && readPolicy(this.state.cwd).mode === "private" ? "local" : "server"),
         log: (line) => this.log(line),
       });
     }
