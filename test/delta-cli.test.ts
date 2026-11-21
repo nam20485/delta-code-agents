@@ -61,6 +61,7 @@ test("parseFirstJson handles pretty-printed multi-line errors", () => {
 
 test("currentOrganization parses the org id and returns null on failure", async () => {
   process.env["DELTA_QWEN_DELTA_BIN"] = fileURLToPath(new URL("./fake-delta.js", import.meta.url));
+  chmodSync(process.env["DELTA_QWEN_DELTA_BIN"], 0o755);
   assert.equal(await currentOrganization(), "org_fake");
   const saved = process.env["DELTA_QWEN_DELTA_BIN"];
   process.env["DELTA_QWEN_DELTA_BIN"] = "/nonexistent/delta";
