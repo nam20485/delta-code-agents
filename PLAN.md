@@ -210,6 +210,10 @@ rule).
 - Retry only when `error.retryable` is true, honoring `retry_after_ms`.
 - `fenced` receipt or `producer.turn superseded` → set superseded flag, stop
   recording turn content, keep late output's original `turnSequence`.
+  Supersession is **turn-scoped**: a new user-initiated prompt reclaims the
+  thread for the local agent (clears the flag); if the teammate still owns it,
+  Delta re-fences the next append and the flag is set again. This avoids one
+  takeover permanently denying tool use across the session and resume.
 - Offline: `thread create --organization <id> --visibility private` (returns
   without network; upload happens in background), then `append --acknowledge
   local` (from `/delta-setup` policy); surface `upload.state`/`reload_required`
