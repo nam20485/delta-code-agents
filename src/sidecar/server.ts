@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { appendFile } from "node:fs/promises";
-import { closeSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -9,6 +9,8 @@ import { ensureDir } from "../lib/fsx.js";
 import { pidAlive } from "../lib/proc.js";
 import { DELTA_SOURCE, PRODUCER_NAME } from "../lib/constants.js";
 import { REQUIRED_CONTRACT, runDelta, threadContract } from "../delta-cli.js";
+import { readPolicy, writePolicy, isSyncMode, type ProjectPolicy, type SyncMode } from "../policy.js";
+import { backfillTranscript } from "../backfill.js";
 import { sessionDir, sessionsRoot } from "../lib/paths.js";
 import { loadState, newState, saveState, type RecordingState, type SessionState } from "./state.js";
 import { Outbox, type FlushTarget } from "./outbox.js";
@@ -48,15 +50,15 @@ export interface ShareResponse {
 
 async function runDeltaCreate(
   externalId: string,
+  organization?: string,
 ): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
-  const result = await runDelta<{ thread_id?: unknown }>([
-    "thread",
-    "create",
-    "--source",
-    DELTA_SOURCE,
-    "--external-id",
-    externalId,
-  ]);
+  const args = ["thread", "create", "--source", DELTA_SOURCE, "--external-id", externalId];
+  if (organization !== undefined && organization.length > 0) {
+    // Bind the thread to the chosen org (offline create); sharing then targets
+    // that org rather than the CLI's current selection.
+    args.push("--organization", organization, "--visibility", "private");
+  }
+  const result = await runDelta<{ thread_id?: unknown }>(args);
   if (!result.ok) return { ok: false, error: result.error.message };
   const threadId = result.value["thread_id"];
   if (typeof threadId !== "string" || threadId.length === 0) {
@@ -130,6 +132,9 @@ export class Sidecar {
   private watcher: Watcher | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
+  private enableInFlight: Promise<{ ok: true } | { ok: false; error: string }> | null = null;
+  private enableGeneration = -1;
+  private eventBuffer: Record<string, unknown>[] = [];
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
   constructor(state: SessionState, dir: string) {
@@ -168,22 +173,8 @@ export class Sidecar {
     const recording = this.state.recording;
     if (recording === undefined || !recording.enabled) return null;
     if (this.recorder === null) {
-      this.outbox = new Outbox(join(this.dir, "outbox.jsonl"));
-      this.mounts = new Mounts({
-        threadId: recording.thread_id,
-        externalId: this.state.external_id,
-        sessionId: this.state.session_id,
-        ownerPid: () => this.state.qwen_pid,
-        captureEnabled: () => this.state.recording?.capture_enabled !== false,
-        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
-        log: (line) => this.log(line),
-        onCaptureUnavailable: () => {
-          if (this.state.recording !== undefined) {
-            this.state.recording.capture_enabled = false;
-            this.save();
-          }
-        },
-      });
+      this.outbox = new Outbox(this.outboxFile());
+      const mounts = this.ensureMounts();
       this.recorder = new Recorder({
         outbox: this.outbox,
         recording,
@@ -199,13 +190,13 @@ export class Sidecar {
       if (
         typeof recording.worktree_reference === "string" &&
         this.state.cwd.length > 0 &&
-        !this.mounts.hasChildren
+        !mounts.hasChildren
       ) {
-        void this.mounts.restore(recording.worktree_reference, this.state.cwd);
+        void mounts.restore(recording.worktree_reference, this.state.cwd);
       }
       // Remote activity: watch the thread, feed the inbox, react to
       // supersession and attachment changes.
-      this.inbox = new Inbox(this.dir);
+      this.inbox = new Inbox(this.dir, this.state.generation);
       this.watcher = new Watcher({
         threadId: recording.thread_id,
         externalId: this.state.external_id,
@@ -245,21 +236,29 @@ export class Sidecar {
   private async tryFlush(force = false): Promise<void> {
     const recorder = this.ensureRecorder();
     if (recorder === null || this.outbox === null) return;
+    // Capture the generation's objects so a concurrent /clear reset cannot
+    // make the continuation write stale outcomes onto the new recording or
+    // dereference a nulled outbox.
+    const outbox = this.outbox;
+    const recording = this.state.recording;
     // Retry policy (plan): retry only when `error.retryable`, honoring
     // `retry_after_ms`; after a non-retryable error, wait for new records.
     // `force` (shutdown's final attempt) bypasses the guards.
     const err = this.lastFlushError;
     if (!force && err !== null) {
-      if (!err.retryable && this.outbox.size === err.size) return;
+      if (!err.retryable && outbox.size === err.size) return;
       if (err.retryable && Date.now() - err.at < Math.max(err.retryAfterMs, 250)) return;
     }
     const outcome = await recorder.finish(this.flushTarget());
+    // If a reset replaced the recording/outbox while we awaited, drop the
+    // stale outcome entirely.
+    if (this.outbox !== outbox || this.state.recording !== recording) return;
     if (outcome.error !== null) {
       this.lastFlushError = {
         retryable: outcome.retryable,
         retryAfterMs: outcome.retryAfterMs ?? 0,
         at: Date.now(),
-        size: this.outbox.size,
+        size: outbox.size,
       };
     } else {
       this.lastFlushError = null;
@@ -282,8 +281,8 @@ export class Sidecar {
     }
   }
 
-  /** CLI-driven share flow (`cli.ts share [--confirm]`). */
-  share(confirm: boolean): Promise<ShareResponse> {
+  /** CLI-driven share flow (`cli.ts share [--confirm] [emails...]`). */
+  share(confirm: boolean, emails: string[] = []): Promise<ShareResponse> {
     if (this.shareInFlight !== null) {
       // A confirming caller must not receive the unconfirmed call's answer.
       if (confirm !== this.shareInFlightConfirm) {
@@ -295,13 +294,13 @@ export class Sidecar {
       return this.shareInFlight;
     }
     this.shareInFlightConfirm = confirm;
-    this.shareInFlight = this.doShare(confirm).finally(() => {
+    this.shareInFlight = this.doShare(confirm, emails).finally(() => {
       this.shareInFlight = null;
     });
     return this.shareInFlight;
   }
 
-  private async doShare(confirm: boolean): Promise<ShareResponse> {
+  private async doShare(confirm: boolean, emails: string[]): Promise<ShareResponse> {
     const recording = this.recordingState();
     if (recording.consent !== "granted") {
       if (!confirm) {
@@ -312,36 +311,138 @@ export class Sidecar {
       recording.consent = "granted";
       this.save();
     }
-    if (!recording.enabled) {
-      const contract = await threadContract();
-      if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
-        return {
-          status: "error",
-          message: contract.ok
-            ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
-            : contract.error.message,
-        };
+    const enabled = await this.enableRecording();
+    if (!enabled.ok) return { status: "error", message: enabled.error };
+    if (emails.length > 0) {
+      const invited = await runDelta<{ results?: unknown }>([
+        "thread",
+        "invite",
+        recording.thread_id,
+        ...emails,
+      ]);
+      if (!invited.ok) return { status: "error", message: invited.error.message, thread_id: recording.thread_id };
+      return {
+        status: "shared",
+        thread_id: recording.thread_id,
+        message: `invited: ${emails.join(", ")}`,
+      };
+    }
+    const shared = await runDeltaShare(recording.thread_id);
+    return this.shareResponse(shared);
+  }
+
+  private outboxFile(): string {
+    return join(this.dir, `outbox-${this.state.generation}.jsonl`);
+  }
+
+  /**
+   * Contract gate + idempotent thread create + backfill + checkout adoption.
+   * Serialized: concurrent callers (deferred SessionStart applyPolicy, /setup,
+   * /share) share one in-flight enable so the transcript is backfilled once
+   * and the checkout adopted once. Events arriving during the enable window
+   * are buffered and replayed afterwards (not dropped).
+   */
+  private enableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const generation = this.state.generation;
+    if (this.enableInFlight !== null && this.enableGeneration === generation) {
+      return this.enableInFlight;
+    }
+    // A different generation (a /clear landed mid-enable): chain a fresh enable
+    // after the in-flight one (which aborts at its staleness check) so the new
+    // conversation is recorded rather than stranded on the stale promise.
+    const previous = this.enableInFlight ?? Promise.resolve({ ok: true as const });
+    const next = previous.catch(() => {}).then(() => this.doEnableRecording());
+    this.enableInFlight = next;
+    this.enableGeneration = generation;
+    void next.finally(() => {
+      if (this.enableInFlight === next) {
+        this.enableInFlight = null;
+        this.drainEventBuffer();
       }
-      const created = await runDeltaCreate(this.state.external_id);
-      if (!created.ok) return { status: "error", message: created.error };
-      recording.thread_id = created.threadId;
-      recording.enabled = true;
-      this.save();
-      if (this.state.cwd.length > 0) {
-        this.ensureRecorder();
-        const result = await this.mounts?.adoptCheckout(this.state.cwd);
-        if (result !== undefined && result.ok && typeof result.reference === "string") {
-          recording.worktree_reference = result.reference;
-          this.save();
-        } else if (result !== undefined && !result.ok) {
-          this.log(`conversation-only recording: ${result.reason ?? "unknown"}`);
+    });
+    return next;
+  }
+
+  private async doEnableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const recording = this.recordingState();
+    if (recording.enabled) return { ok: true };
+    const generation = this.state.generation;
+    // A /clear during any await bumps the generation and replaces recording;
+    // re-check after each await so we never write into the new generation.
+    const stale = (): boolean =>
+      this.state.generation !== generation || this.state.recording !== recording;
+    const organization = readPolicy(this.state.cwd).organization;
+    const contract = await threadContract();
+    if (stale()) return { ok: false, error: "session reset during enable" };
+    if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
+      return {
+        ok: false,
+        error: contract.ok
+          ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
+          : contract.error.message,
+      };
+    }
+    const created = await runDeltaCreate(this.state.external_id, organization);
+    if (stale()) return { ok: false, error: "session reset during enable" };
+    if (!created.ok) return { ok: false, error: created.error };
+    // Backfill BEFORE enabling: while enabled is false no live recorder exists,
+    // so concurrent events cannot bump next_sequence. The async stream keeps
+    // the most recent history; events during the window are buffered.
+    if (this.state.transcript_path !== undefined && recording.next_sequence === 1) {
+      const { updates, truncated } = await backfillTranscript(this.state.transcript_path);
+      if (stale()) return { ok: false, error: "session reset during enable" };
+      if (updates.length > 0) {
+        const outbox = new Outbox(this.outboxFile());
+        for (const update of updates) {
+          outbox.add({ sequence: recording.next_sequence, update });
+          recording.next_sequence += 1;
         }
+        this.log(
+          `backfilled ${updates.length} historical records` +
+            (truncated ? " (older history truncated to the most recent records)" : ""),
+        );
       }
     }
+    recording.thread_id = created.threadId;
+    recording.enabled = true;
+    this.save();
+    // ensureRecorder restores mounts when a worktree reference already exists
+    // (pause/resume), so only adopt a fresh checkout when there is none.
     this.ensureRecorder();
-    const shared = await runDeltaShare(recording.thread_id);
+    if (this.state.cwd.length > 0 && recording.worktree_reference === undefined) {
+      const result = await this.ensureMounts().adoptCheckout(this.state.cwd);
+      if (stale()) return { ok: false, error: "session reset during enable" };
+      if (result.ok && typeof result.reference === "string") {
+        recording.worktree_reference = result.reference;
+        this.save();
+      } else if (!result.ok) {
+        this.log(`conversation-only recording: ${result.reason ?? "unknown"}`);
+      }
+    }
+    return { ok: true };
+  }
+
+  /** Replay events buffered while an enable was in flight. */
+  private drainEventBuffer(): void {
+    const buffered = this.eventBuffer;
+    this.eventBuffer = [];
+    if (buffered.length === 0) return;
+    const recorder = this.ensureRecorder();
+    if (recorder === null) {
+      this.log(`dropped ${buffered.length} buffered events (recording not enabled)`);
+      return;
+    }
+    for (const ev of buffered) {
+      recorder.record(ev);
+      const n = ev["hook_event_name"];
+      if (n === "Stop" || n === "StopFailure" || n === "SessionEnd") void this.tryFlush();
+    }
+  }
+
+  private shareResponse(shared: { ok: true; url: string | null } | { ok: false; error: string }): ShareResponse {
+    const recording = this.recordingState();
     const warning =
-      this.state.recording?.capture_enabled === false
+      recording.capture_enabled === false
         ? "this delta CLI attributes edits only for claude-code sessions; edits will appear unattributed"
         : undefined;
     const response: ShareResponse = {
@@ -352,6 +453,158 @@ export class Sidecar {
     if (!shared.ok) response.message = shared.error;
     if (warning !== undefined) response.warning = warning;
     return response;
+  }
+
+  /**
+   * Apply the repository sync policy on session start (plan: Project policy).
+   * `manual` records nothing until /delta-share; `private` records locally;
+   * `team` also shares with the org. Choosing a non-manual mode via /delta-setup
+   * is the user's consent, so it is granted here.
+   */
+  async applyPolicy(): Promise<ShareResponse | null> {
+    if (this.state.cwd.length === 0) return null;
+    const policy = readPolicy(this.state.cwd);
+    if (policy.mode === "manual") return null;
+    const recording = this.recordingState();
+    recording.consent = "granted";
+    this.save();
+    const enabled = await this.enableRecording();
+    if (!enabled.ok) return { status: "error", message: enabled.error };
+    if (policy.mode === "team") {
+      const shared = await runDeltaShare(recording.thread_id);
+      return this.shareResponse(shared);
+    }
+    return { status: "shared", thread_id: recording.thread_id };
+  }
+
+  /** /delta-setup: persist the policy and apply it immediately. */
+  async setup(mode: SyncMode, organization?: string): Promise<ShareResponse> {
+    if (this.state.cwd.length === 0) {
+      return { status: "error", message: "session has no working directory" };
+    }
+    const policy: ProjectPolicy = { mode };
+    if (organization !== undefined) policy.organization = organization;
+    writePolicy(this.state.cwd, policy);
+    this.log(`policy set: ${mode}`);
+    if (mode === "manual") {
+      return { status: "shared", thread_id: this.recordingState().thread_id, message: "manual mode: recording only after /delta-share" };
+    }
+    const applied = await this.applyPolicy();
+    return applied ?? { status: "shared", thread_id: this.recordingState().thread_id };
+  }
+
+  /** /delta-pause: stop recording/sync for this session, keeping the thread.
+   * Null the recorder/watcher/inbox so a later /delta-share rebuilds them
+   * (a stopped Watcher is terminal); keep thread id, consent, worktree ref. */
+  pause(): ShareResponse {
+    const recording = this.recordingState();
+    recording.enabled = false;
+    this.save();
+    this.watcher?.stop();
+    this.watcher = null;
+    this.mounts?.stopAll();
+    this.mounts = null;
+    this.recorder = null;
+    this.outbox = null;
+    this.inbox = null;
+    this.log("recording paused");
+    return { status: "shared", thread_id: recording.thread_id, message: "paused; /delta-share resumes in the same thread" };
+  }
+
+  /** /delta-unshare: make the thread private, keeping sync and invitations. */
+  async unshare(): Promise<ShareResponse> {
+    const recording = this.recordingState();
+    if (recording.thread_id.length === 0) {
+      return { status: "error", message: "no thread to unshare" };
+    }
+    const result = await runDelta<{ operation?: unknown }>(["thread", "unshare", recording.thread_id]);
+    if (!result.ok) return { status: "error", message: result.error.message };
+    return { status: "shared", thread_id: recording.thread_id, message: "thread is now private (explicit invitations retained)" };
+  }
+
+  /** /delta-inbox: show pending remote activity without delivering it. */
+  inboxPeek(): { pending: number; text: string } {
+    if (this.inbox === null) return { pending: 0, text: "(no remote activity)" };
+    const batch = this.inbox.nextBatch();
+    if (batch === null) return { pending: 0, text: "(no pending remote activity)" };
+    // Peek only: do not mark delivered; the next user turn injects it.
+    return { pending: this.inbox.pendingCount(), text: batch.text };
+  }
+
+  /** /delta-join <link>: check access, mount the thread's files, return dir. */
+  async joinThread(link: string): Promise<{ status: string; directory?: string; message?: string }> {
+    const status = await runDelta<{ access?: { state?: unknown } }>([
+      "thread",
+      "status",
+      link,
+      "--source",
+      DELTA_SOURCE,
+      "--external-id",
+      this.state.external_id,
+    ]);
+    if (!status.ok) {
+      return { status: "error", message: `cannot access thread: ${status.error.message}` };
+    }
+    if (status.value.access?.state !== "granted") {
+      return { status: "error", message: `access not granted (state: ${String(status.value.access?.state)})` };
+    }
+    const mounts = this.ensureMounts();
+    const joined = await mounts.join(link);
+    if (!joined.ok) return { status: "error", message: joined.error };
+    this.log(`joined thread; checkout at ${joined.directory}`);
+    return {
+      status: "joined",
+      directory: joined.directory,
+      message: `Run qwen's /cd ${joined.directory} to work in the thread's checkout.`,
+    };
+  }
+
+  /** `/clear`: bind a fresh thread for the new conversation, leaving the old
+   * one idle. Best-effort flush of the old outbox first so undelivered records
+   * still reach the old thread. */
+  private resetForClear(): void {
+    void this.tryFlush();
+    this.state.clear_count += 1;
+    this.state.generation += 1;
+    this.state.external_id = `${this.state.session_id}-c${this.state.clear_count}`;
+    // A fresh generation gives the new conversation empty outbox/inbox files,
+    // so pre-clear records can never be appended to the new thread. The
+    // SessionStart capture already overwrote transcript_path with the new
+    // conversation's transcript, so post-clear backfill uses the fresh file.
+    this.watcher?.stop();
+    this.watcher = null;
+    this.mounts?.stopAll();
+    this.mounts = null;
+    this.recorder = null;
+    this.outbox = null;
+    this.inbox = null;
+    // Pre-clear buffered events belong to the cleared conversation; drop them
+    // so the chained enable's drain cannot replay them into the new thread.
+    this.eventBuffer = [];
+    delete this.state.recording;
+    this.save();
+    this.log(`clear: new conversation external id ${this.state.external_id}`);
+  }
+
+  private ensureMounts(): Mounts {    if (this.mounts === null) {
+      const recording = this.recordingState();
+      this.mounts = new Mounts({
+        threadId: recording.thread_id,
+        externalId: this.state.external_id,
+        sessionId: this.state.session_id,
+        ownerPid: () => this.state.qwen_pid,
+        captureEnabled: () => this.state.recording?.capture_enabled !== false,
+        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
+        log: (line) => this.log(line),
+        onCaptureUnavailable: () => {
+          if (this.state.recording !== undefined) {
+            this.state.recording.capture_enabled = false;
+            this.save();
+          }
+        },
+      });
+    }
+    return this.mounts;
   }
 
   async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -411,14 +664,82 @@ export class Sidecar {
           return;
         }
         const body = await readBody(req);
-        let request: { confirm?: unknown };
+        let request: { confirm?: unknown; emails?: unknown };
         try {
-          request = JSON.parse(body.toString("utf8")) as { confirm?: unknown };
+          request = JSON.parse(body.toString("utf8")) as { confirm?: unknown; emails?: unknown };
         } catch {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        sendJson(res, 200, await this.share(request["confirm"] === true));
+        const emails = Array.isArray(request["emails"])
+          ? request["emails"].filter((e): e is string => typeof e === "string")
+          : [];
+        sendJson(res, 200, await this.share(request["confirm"] === true, emails));
+        return;
+      }
+      if (req.method === "POST" && url === "/setup") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const body = await readBody(req);
+        let request: { mode?: unknown; organization?: unknown };
+        try {
+          request = JSON.parse(body.toString("utf8")) as { mode?: unknown; organization?: unknown };
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (!isSyncMode(request["mode"])) {
+          sendJson(res, 400, { error: "mode must be private, team, or manual" });
+          return;
+        }
+        const org = typeof request["organization"] === "string" ? request["organization"] : undefined;
+        sendJson(res, 200, await this.setup(request["mode"], org));
+        return;
+      }
+      if (req.method === "POST" && url === "/join") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const body = await readBody(req);
+        let request: { link?: unknown };
+        try {
+          request = JSON.parse(body.toString("utf8")) as { link?: unknown };
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (typeof request["link"] !== "string" || request["link"].length === 0) {
+          sendJson(res, 400, { error: "link is required" });
+          return;
+        }
+        sendJson(res, 200, await this.joinThread(request["link"]));
+        return;
+      }
+      if (req.method === "POST" && url === "/pause") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, this.pause());
+        return;
+      }
+      if (req.method === "POST" && url === "/unshare") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, await this.unshare());
+        return;
+      }
+      if (req.method === "GET" && url === "/inbox") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, this.inboxPeek());
         return;
       }
       sendJson(res, 404, { error: "not found" });
@@ -456,11 +777,35 @@ export class Sidecar {
       this.state.cwd = event["cwd"];
       this.save();
     }
+    if (
+      event["hook_event_name"] === "SessionStart" &&
+      typeof event["transcript_path"] === "string" &&
+      event["transcript_path"].length > 0
+    ) {
+      // SessionStart-only: a /clear deletes this (resetForClear) and the new
+      // conversation records live without backfilling the cleared history.
+      this.state.transcript_path = event["transcript_path"];
+      this.save();
+    }
     const name =
       typeof event["hook_event_name"] === "string"
         ? (event["hook_event_name"] as string)
         : "unknown";
     this.log(`event ${name}`);
+
+    // `/clear` starts a new conversation: suffix the external id with a clear
+    // counter so the next recording binds a fresh thread (the old thread is
+    // left idle, never finalized). `compact` keeps the same conversation.
+    if (name === "SessionStart" && event["source"] === "clear") {
+      this.resetForClear();
+    }
+    // Apply the repository sync policy on session start (not on compact, which
+    // continues the same recording). Deferred so the response is not blocked
+    // by the delta calls enableRecording makes.
+    if (name === "SessionStart" && event["source"] !== "compact") {
+      if (defer !== undefined) defer(() => void this.applyPolicy());
+      else void this.applyPolicy();
+    }
 
     // Supersession is turn-scoped, not permanent: a new user-initiated turn
     // reclaims the thread for the local agent. If the teammate still owns it,
@@ -495,11 +840,19 @@ export class Sidecar {
       };
     }
 
+    // Buffer events that arrive while an enable is in flight (recording not
+    // yet enabled); they are replayed once the recorder exists, not dropped.
+    // SessionEnd is never buffered: it must always reach teardown even if the
+    // whole session lived inside the enable window (e.g. a one-shot qwen -p).
+    if (this.enableInFlight !== null && name !== "SessionEnd") {
+      this.eventBuffer.push(event as Record<string, unknown>);
+      return {};
+    }
+
     const recorder = this.ensureRecorder();
     if (recorder !== null) {
       recorder.record(event as Record<string, unknown>);
     }
-
     // Inbox delivery: inject pending teammate activity into a user-initiated
     // turn. Mark delivered only once the response has been written back to
     // Qwen (deferred to response close). A turn cancelled after delivery is
@@ -563,6 +916,15 @@ export class Sidecar {
     if (this.ownerTimer !== null) clearInterval(this.ownerTimer);
     if (this.flushTimer !== null) clearInterval(this.flushTimer);
     this.log(`shutdown: ${reason}`);
+    // If an enable is still in flight (e.g. a one-shot qwen -p whose whole
+    // session lives inside the enable window), let it finish so the transcript
+    // is recorded before teardown, bounded so a hung enable cannot block exit.
+    if (this.enableInFlight !== null) {
+      await Promise.race([
+        this.enableInFlight.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 30_000).unref()),
+      ]);
+    }
     // Final flush before tearing down mounts, bounded by the delta timeout.
     // Force it: the retry guards (backoff / non-retryable-without-new-
     // records) must not let the sidecar exit without a last delivery try.
@@ -618,13 +980,18 @@ function cleanupStaleSessions(currentSessionId: string): void {
     } catch {
       continue;
     }
-    // Undelivered records outrank every grace period. A stat check avoids
-    // reading/parsing megabytes of outbox per session on the event loop.
+    // Undelivered records outrank every grace period. Outbox files are
+    // generation-suffixed (outbox-<gen>.jsonl); a stat check on any of them
+    // avoids reading/parsing megabytes per session on the event loop.
     let outboxBytes = 0;
     try {
-      outboxBytes = statSync(join(dir, "outbox.jsonl")).size;
+      for (const entry of readdirSync(dir)) {
+        if (entry === "outbox.jsonl" || (entry.startsWith("outbox-") && entry.endsWith(".jsonl"))) {
+          outboxBytes += statSync(join(dir, entry)).size;
+        }
+      }
     } catch {
-      // No outbox file.
+      // No outbox files.
     }
     if (outboxBytes > 0) continue;
     const state = loadState(dir);
@@ -742,6 +1109,18 @@ export async function startSidecar(sessionId: string): Promise<void> {
     delete state.ended_at;
   }
   saveState(dir, state);
+  // Migrate legacy (pre-generation) outbox/inbox filenames so pending records
+  // and delivered flags survive the upgrade instead of being stranded.
+  try {
+    const legacyOutbox = join(dir, "outbox.jsonl");
+    const genOutbox = join(dir, `outbox-${state.generation}.jsonl`);
+    if (existsSync(legacyOutbox) && !existsSync(genOutbox)) renameSync(legacyOutbox, genOutbox);
+    const legacyInbox = join(dir, "inbox.json");
+    const genInbox = join(dir, `inbox-${state.generation}.json`);
+    if (existsSync(legacyInbox) && !existsSync(genInbox)) renameSync(legacyInbox, genInbox);
+  } catch {
+    // Best effort.
+  }
   const sidecar = new Sidecar(state, dir);
   const server = createServer((req, res) => {
     void sidecar.route(req, res);

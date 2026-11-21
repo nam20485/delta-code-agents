@@ -1,6 +1,6 @@
 import { readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { REQUIRED_CONTRACT, resolveDeltaBinary, threadContract } from "./delta-cli.js";
+import { REQUIRED_CONTRACT, resolveDeltaBinary, runDelta, threadContract } from "./delta-cli.js";
 import { readJson } from "./lib/fsx.js";
 import { sessionsRoot } from "./lib/paths.js";
 import { pidAlive } from "./lib/proc.js";
@@ -11,12 +11,15 @@ const USAGE = `delta-qwen CLI
 Usage: delta-qwen <command>   (slash commands call this via ~/.qwen/delta/cli.js)
 
 Commands:
-  share [--confirm]   Share the current directory's Qwen session to your org
-  doctor              Check the delta CLI, thread contract, router, sessions
-  help                Show this help
-
-Slash commands (/delta-share, /delta-join, /delta-setup, /delta-inbox,
-/delta-org) arrive with Milestone 4.
+  share [--confirm] [emails...]  Share this directory's session (org, or invite emails)
+  setup <private|team|manual> [--org ID]  Set this repo's sync policy
+  join <link>           Join a shared thread; prints the checkout directory
+  pause                 Stop recording/sync for this session (thread kept)
+  unshare               Make the thread private (invitations retained)
+  inbox                 Show pending teammate activity
+  org <list|current|switch|create|invite> ...  Manage Delta teams
+  doctor                Check the delta CLI, contract, router, sessions
+  help                  Show this help
 `;
 
 interface SessionStateSummary {
@@ -69,57 +72,148 @@ interface ShareResponse {
   thread_id?: unknown;
   url?: unknown;
   warning?: unknown;
+  directory?: unknown;
+  pending?: unknown;
+  text?: unknown;
 }
 
-async function share(confirm: boolean): Promise<number> {
+/** POST/GET the session sidecar for this cwd; null when no live session. */
+async function sidecarCall(
+  path: string,
+  body?: unknown,
+  method: "POST" | "GET" = "POST",
+  timeoutMs = 90_000,
+): Promise<ShareResponse | null> {
   const session = findSessionByCwd(process.cwd());
   if (session === null || typeof session["port"] !== "number" || typeof session["token"] !== "string") {
-    console.error(
-      "No live delta-qwen session found for this directory. Start a Qwen Code " +
-        "session here first (its SessionStart hook creates the session state).",
-    );
-    return 1;
+    return null;
   }
-  let res: Response;
-  try {
-    res = await fetch(`http://127.0.0.1:${session["port"]}/share`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${session["token"]}`,
-      },
-      body: JSON.stringify({ confirm }),
-      // Worst-case first share: contract + create + adoption + share, each
-      // a delta call with its own 15s budget, run serially on the sidecar.
-      signal: AbortSignal.timeout(90_000),
-    });
-  } catch (err) {
-    if (err instanceof Error && err.name === "TimeoutError") {
-      console.error(
-        "The share request is still running on the sidecar (slow network?); " +
-          "check `delta-qwen doctor` before retrying.",
-      );
-      return 1;
-    }
-    console.error(`Cannot reach the session sidecar: ${String(err)}`);
-    return 1;
-  }
-  if (!res.ok) {
-    console.error(`Sidecar share failed (HTTP ${res.status}).`);
-    return 1;
-  }
-  const body = (await res.json()) as ShareResponse;
+  const res = await fetch(`http://127.0.0.1:${session["port"]}${path}`, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${session["token"]}`,
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) return { status: "error", message: `sidecar ${path} failed (HTTP ${res.status})` };
+  return (await res.json()) as ShareResponse;
+}
+
+function noSession(): number {
+  console.error(
+    "No live delta-qwen session found for this directory. Start a Qwen Code " +
+      "session here first (its SessionStart hook creates the session state).",
+  );
+  return 1;
+}
+
+function printShare(body: ShareResponse): number {
   if (body["status"] === "consent_required") {
     console.log(typeof body["message"] === "string" ? body["message"] : "Consent required.");
     return 0;
   }
-  if (body["status"] !== "shared") {
-    console.error(`Share failed: ${String(body["message"])}`);
+  if (body["status"] === "error") {
+    console.error(`Failed: ${String(body["message"])}`);
     return 1;
   }
-  console.log(`Shared thread: ${String(body["thread_id"])}`);
+  if (typeof body["thread_id"] === "string" && body["thread_id"].length > 0) {
+    console.log(`Thread: ${body["thread_id"]}`);
+  }
   if (typeof body["url"] === "string") console.log(`Open in Delta: ${body["url"]}`);
+  if (typeof body["directory"] === "string") console.log(`Checkout: ${body["directory"]}`);
+  if (typeof body["message"] === "string") console.log(body["message"]);
   if (typeof body["warning"] === "string") console.log(`Note: ${body["warning"]}`);
+  return 0;
+}
+
+async function share(confirm: boolean, emails: string[]): Promise<number> {
+  const body = await fetchSidecar("/share", { confirm, emails });
+  if (body === null) return noSession();
+  return printShare(body);
+}
+
+/**
+ * Wrap sidecarCall so a fetch failure is reported distinctly from "no live
+ * session" (sidecarCall returns null only when no session matches the cwd).
+ * A timeout means the request may still be running; other errors mean the
+ * sidecar is unreachable. Returns an error body (printShare exits non-zero).
+ */
+async function fetchSidecar(
+  path: string,
+  body?: unknown,
+  method: "POST" | "GET" = "POST",
+  timeoutMs = 90_000,
+): Promise<ShareResponse | null> {
+  try {
+    return await sidecarCall(path, body, method, timeoutMs);
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      return {
+        status: "error",
+        message:
+          `the ${path} request is still running on the sidecar (slow network?); ` +
+          "check `delta-qwen doctor` before retrying",
+      };
+    }
+    return { status: "error", message: `cannot reach the session sidecar: ${String(err)}` };
+  }
+}
+
+async function setup(mode: string, org: string | undefined): Promise<number> {
+  if (mode !== "private" && mode !== "team" && mode !== "manual") {
+    console.error("usage: delta-qwen setup <private|team|manual> [--org ID]");
+    return 1;
+  }
+  const body = await fetchSidecar("/setup", { mode, ...(org !== undefined ? { organization: org } : {}) });
+  if (body === null) return noSession();
+  if (body["status"] !== "error") {
+    console.log(`Sync policy for this repository: ${mode}`);
+  }
+  return printShare(body);
+}
+
+async function joinThreadCmd(link: string): Promise<number> {
+  if (link.length === 0) {
+    console.error("usage: delta-qwen join <thread-link>");
+    return 1;
+  }
+  const body = await fetchSidecar("/join", { link }, "POST", 120_000);
+  if (body === null) return noSession();
+  return printShare(body);
+}
+
+async function simplePost(path: string): Promise<number> {
+  const body = await fetchSidecar(path, {});
+  if (body === null) return noSession();
+  return printShare(body);
+}
+
+async function inbox(): Promise<number> {
+  const body = await fetchSidecar("/inbox", undefined, "GET", 10_000);
+  if (body === null) return noSession();
+  if (body["status"] === "error") {
+    console.error(`inbox failed: ${String(body["message"])}`);
+    return 1;
+  }
+  console.log(typeof body["text"] === "string" ? body["text"] : "(no remote activity)");
+  return 0;
+}
+
+async function org(args: string[]): Promise<number> {
+  const sub = args[0] ?? "list";
+  const allowed = ["list", "current", "switch", "create", "invite"];
+  if (!allowed.includes(sub)) {
+    console.error(`usage: delta-qwen org <${allowed.join("|")}> ...`);
+    return 1;
+  }
+  const result = await runDelta<Record<string, unknown>>(["org", sub, ...args.slice(1)]);
+  if (!result.ok) {
+    console.error(`org ${sub} failed: ${result.error.message}`);
+    return 1;
+  }
+  console.log(JSON.stringify(result.value, null, 2));
   return 0;
 }
 
@@ -176,9 +270,54 @@ async function doctor(): Promise<number> {
   return 0;
 }
 
+/**
+ * Command arguments from process.argv. Slash-command templates interpolate
+ * `{{args}}` into the `!{}` shell line; Qwen Code shell-escapes `{{args}}`
+ * inside `!{}` before execution (documented in its commands guide), which is
+ * the host boundary that both prevents shell injection and preserves
+ * multi-word arguments. Qwen custom commands offer no non-textual argument
+ * channel, so this escaping is the mitigation we rely on.
+ */
+function commandArgs(): string[] {
+  return process.argv.slice(3);
+}
+
+/** Parse `setup <mode> [--org ID | --org=ID]` positionally. */
+function parseSetup(rest: string[]): { mode: string; org: string | undefined } {
+  let org: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    if (arg === "--org") {
+      org = rest[++i];
+    } else if (arg.startsWith("--org=")) {
+      org = arg.slice("--org=".length);
+    } else if (!arg.startsWith("--")) {
+      positional.push(arg);
+    }
+  }
+  return { mode: positional[0] ?? "", org };
+}
+
 const command = process.argv[2] ?? "help";
+const rest = commandArgs();
 if (command === "share") {
-  process.exit(await share(process.argv.includes("--confirm")));
+  const emails = rest.filter((a) => !a.startsWith("--") && a !== "confirm");
+  const confirm = rest.includes("--confirm") || rest.includes("confirm");
+  process.exit(await share(confirm, emails));
+} else if (command === "setup") {
+  const { mode, org } = parseSetup(rest);
+  process.exit(await setup(mode, org));
+} else if (command === "join") {
+  process.exit(await joinThreadCmd(rest[0] ?? ""));
+} else if (command === "pause") {
+  process.exit(await simplePost("/pause"));
+} else if (command === "unshare") {
+  process.exit(await simplePost("/unshare"));
+} else if (command === "inbox") {
+  process.exit(await inbox());
+} else if (command === "org") {
+  process.exit(await org(rest));
 } else if (command === "doctor") {
   process.exit(await doctor());
 } else if (command === "help") {

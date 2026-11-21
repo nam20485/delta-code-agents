@@ -39,8 +39,8 @@ export class Inbox {
    * (hidden) or removed, so pending items become renderable roots. */
   private live = false;
 
-  constructor(dir: string) {
-    this.file = join(dir, "inbox.json");
+  constructor(dir: string, generation = 0) {
+    this.file = join(dir, `inbox-${generation}.json`);
     const saved = readJson<PersistedInbox>(this.file);
     if (saved !== null && Array.isArray(saved.entries)) {
       for (const entry of saved.entries) this.entries.set(entry.id, entry);

@@ -8,7 +8,10 @@ echo "== install =="
 [ -d node_modules ] || npm ci
 
 echo "== markdownlint =="
-./node_modules/.bin/markdownlint-cli2 "**/*.md" "#node_modules" "#dist" "#.qwen"
+./node_modules/.bin/markdownlint-cli2 "**/*.md" "#node_modules" "#dist" "#.qwen" "#commands"
+# Command files are prompt templates: lint them with MD041 (first-line
+# heading) disabled via a dedicated config (overrides don't apply to globs).
+./node_modules/.bin/markdownlint-cli2 --config .markdownlint-cli2.commands.jsonc "commands/**/*.md"
 
 echo "== build (tsc) =="
 ./node_modules/.bin/tsc -p .

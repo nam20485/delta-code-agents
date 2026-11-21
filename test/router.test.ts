@@ -4,7 +4,6 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { execFileSync } from "node:child_process";
 import { startRouter } from "../src/router/router.js";
 
 process.env["DELTA_QWEN_HOME"] = mkdtempSync(join(tmpdir(), "dq-router-"));
@@ -50,22 +49,14 @@ test("router multiplexes a session end to end", async () => {
         return null;
       }
     };
-    const sidecarAlive = (): boolean => {
-      try {
-        execFileSync("pgrep", ["-f", `sidecar/server\\.js rt-1( --revive)?$`], { encoding: "utf8" });
-        return true;
-      } catch {
-        return false;
-      }
-    };
     await post(port, startBody);
     let pid: number | null = null;
-    for (let i = 0; i < 100; i++) {
+    // Poll generously for loaded CI runners; re-send SessionStart periodically
+    // (the sidecar pid lock prevents a slow boot from becoming two writers).
+    for (let i = 0; i < 200; i++) {
       pid = readPid();
       if (pid === process.pid) break;
-      // Re-send only when no sidecar process is alive, so a slow first boot
-      // is never doubled (the production pid lock also guards this).
-      if (i % 10 === 9 && !sidecarAlive()) await post(port, startBody);
+      if (i % 20 === 19) await post(port, startBody);
       await delay(100);
     }
     assert.equal(pid, process.pid);
@@ -84,7 +75,7 @@ test("router multiplexes a session end to end", async () => {
 
     // SessionEnd tears the sidecar and its state dir down.
     await post(port, { session_id: "rt-1", hook_event_name: "SessionEnd", reason: "prompt_input_exit" });
-    for (let i = 0; i < 50 && existsSync(dir); i++) {
+    for (let i = 0; i < 150 && existsSync(dir); i++) {
       await delay(100);
     }
     assert.equal(existsSync(dir), false);

@@ -378,8 +378,13 @@ in a throwaway Git repo:
    injection with delivery ids, supersession gate, `worktrees`-frame mount
    swap. **Done** (live-verified: teammate append → injected context with
    delivery id → no re-injection; deny gate and mount swap covered by tests).
-4. **Commands & policy**: setup/auto modes, CLI consent gate, join,
-   pause/unshare, org commands, mid-session backfill.
+4. **Commands & policy**: setup/auto modes, CLI consent gate, join, org
+   commands, mid-session backfill. **Done**: `/delta-share [confirm] [emails]`,
+   `/delta-setup <private|team|manual>`, `/delta-join`, `/delta-pause`,
+   `/delta-unshare`, `/delta-inbox`, `/delta-org`; `.delta/settings.json` via
+   `.git/info/exclude`; policy auto-apply on SessionStart; qwen-transcript
+   backfill; per-`/clear` external-id suffix. Pause/unshare and the
+   policy-gated `--acknowledge` (still local-ack) carry into M5 polish.
 5. **Subagents** as child threads; polish, unit + fake-CLI suites.
 6. **Docs & release**: README (install via `qwen extensions install <repo
    URL>`), AGENTS.md, release notes; live e2e pass per Verification.

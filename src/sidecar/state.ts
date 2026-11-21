@@ -15,6 +15,10 @@ export interface SessionState {
   token: string;
   /** Session working directory (SessionStart payload), for cli discovery. */
   cwd: string;
+  /** Qwen transcript JSONL path, for mid-session share backfill. */
+  transcript_path?: string;
+  /** Bumped on /clear so a new conversation gets fresh outbox/inbox files. */
+  generation: number;
   created_at: string;
   updated_at: string;
   ended_at?: string;
@@ -58,6 +62,7 @@ export function newState(sessionId: string): SessionState {
     port: 0,
     token: randomBytes(24).toString("hex"),
     cwd: "",
+    generation: 0,
     created_at: now,
     updated_at: now,
   };
@@ -68,7 +73,16 @@ export function stateFile(dir: string): string {
 }
 
 export function loadState(dir: string): SessionState | null {
-  return readJson<SessionState>(stateFile(dir));
+  const state = readJson<SessionState>(stateFile(dir));
+  if (state === null) return null;
+  // Migrate pre-generation state: a missing/non-numeric generation would
+  // otherwise produce outbox-undefined.jsonl / NaN filenames and strand
+  // legacy records and inbox delivered flags.
+  if (typeof state.generation !== "number" || !Number.isFinite(state.generation)) {
+    state.generation = 0;
+  }
+  if (typeof state.clear_count !== "number") state.clear_count = 0;
+  return state;
 }
 
 export function saveState(dir: string, state: SessionState): void {

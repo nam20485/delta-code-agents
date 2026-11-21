@@ -29,6 +29,26 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
+  if (args[0] === "thread" && args[1] === "unshare") {
+    process.stdout.write(`${JSON.stringify({ operation: "unshared" })}\n`);
+    process.exitCode = 0;
+    return;
+  }
+  if (args[0] === "thread" && args[1] === "invite") {
+    process.stdout.write(`${JSON.stringify({ operation: "invited", results: [] })}\n`);
+    process.exitCode = 0;
+    return;
+  }
+  if (args[0] === "thread" && args[1] === "status") {
+    process.stdout.write(`${JSON.stringify({ operation: "status", access: { state: "granted" }, worktrees: { status: "available", items: [] } })}\n`);
+    process.exitCode = 0;
+    return;
+  }
+  if (args[0] === "org") {
+    process.stdout.write(`${JSON.stringify({ operation: "listed", organizations: [{ id: "org_fake", name: "Fake", current: true }] })}\n`);
+    process.exitCode = 0;
+    return;
+  }
   if (args[0] === "thread" && args[1] === "append" && process.env["FAKE_UNKNOWN_DISPO"] === "1") {
     process.stdout.write(`${JSON.stringify({ operation: "appended", sequence: 1, disposition: "rejected" })}\n`);
     process.exitCode = 0;
@@ -53,7 +73,17 @@ async function main(): Promise<void> {
     return;
   }
   if ((args[0] === "worktree" && args[1] === "mount") || (args[0] === "thread" && args[1] === "mount")) {
-    // Long-running in reality; exiting immediately is fine for tests.
+    if (args.includes("--join")) {
+      // Join mount: emit the ready directory line, then stay alive.
+      process.stdout.write(`${JSON.stringify({ directory: "/tmp/fake-join-checkout" })}\n`);
+      const keepAlive = setInterval(() => {}, 1_000);
+      process.on("SIGTERM", () => {
+        clearInterval(keepAlive);
+        process.exitCode = 0;
+      });
+      return;
+    }
+    // Keepalive mount: exiting immediately is fine for tests.
     process.exitCode = 0;
     return;
   }
