@@ -9,6 +9,7 @@ import type { RecordingState, TurnStateInfo } from "./state.js";
 interface Child {
   reference: string;
   externalId: string;
+  stateFile: string;
   recording: RecordingState;
   outbox: Outbox;
   recorder: Recorder;
@@ -17,6 +18,8 @@ interface Child {
 interface ChildPersisted {
   next_sequence: number;
   turn_state?: TurnStateInfo;
+  superseded?: boolean;
+  paused?: boolean;
 }
 
 /** Collision-safe filename component for an agent id (a:b vs a/b differ). */
@@ -118,8 +121,8 @@ export class ChildThreads {
       consent: "granted",
       thread_id: reference,
       next_sequence: typeof saved?.next_sequence === "number" ? saved.next_sequence : 1,
-      superseded: false,
-      paused: false,
+      superseded: saved?.superseded === true,
+      paused: saved?.paused === true,
       capture_enabled: false,
       titled: false,
     };
@@ -133,11 +136,13 @@ export class ChildThreads {
       save: () => {
         const persisted: ChildPersisted = { next_sequence: recording.next_sequence };
         if (recording.turn_state !== undefined) persisted.turn_state = recording.turn_state;
+        if (recording.superseded) persisted.superseded = true;
+        if (recording.paused) persisted.paused = true;
         atomicWriteJson(stateFile, persisted);
       },
     });
     this.opts.log(`child thread ${reference} for ${agentType} (${agentId})`);
-    return { reference, externalId, recording, outbox, recorder };
+    return { reference, externalId, stateFile, recording, outbox, recorder };
   }
 
   /** Route one subagent hook event to its child thread. */
@@ -171,6 +176,15 @@ export class ChildThreads {
     // reloaded.
     if (outcome.superseded) child.recording.superseded = true;
     if (outcome.reloadRequired) child.recording.paused = true;
+    if (outcome.superseded || outcome.reloadRequired) {
+      // Persist the flags so a restart does not resume into a contested thread
+      // (no recorder emit happens during a flush to trigger the save callback).
+      const persisted: ChildPersisted = { next_sequence: child.recording.next_sequence };
+      if (child.recording.turn_state !== undefined) persisted.turn_state = child.recording.turn_state;
+      if (child.recording.superseded) persisted.superseded = true;
+      if (child.recording.paused) persisted.paused = true;
+      atomicWriteJson(child.stateFile, persisted);
+    }
     if (outcome.error !== null) {
       this.opts.log(`child flush error: ${outcome.error.message}`);
     }
