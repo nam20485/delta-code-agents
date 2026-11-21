@@ -93,13 +93,21 @@ export class Inbox {
     atomicWriteJson(this.file, value);
   }
 
-  private renderable(entry: InboxEntry): boolean {
+  private renderable(entry: InboxEntry, visiting: Set<string> = new Set()): boolean {
     if (entry.delivered) return false;
     if (entry.afterId === null) return true;
-    if (this.entries.has(entry.afterId)) return true;
-    // Predecessor not in view: hold until the snapshot is complete, then
-    // treat it as a hidden/removed root.
-    return this.live;
+    const pred = this.entries.get(entry.afterId);
+    if (pred === undefined) {
+      // Predecessor not in view: hold until the snapshot is complete, then
+      // treat it as a hidden/removed root.
+      return this.live;
+    }
+    if (pred.delivered) return true;
+    // The hold is transitive: a child waits for its held parent. A cycle in
+    // remote after_id input breaks here instead of recursing forever.
+    if (visiting.has(entry.id)) return true;
+    visiting.add(entry.id);
+    return this.renderable(pred, visiting);
   }
 
   /** Order by after_id where both ends are present; arrival order otherwise. */
@@ -110,9 +118,10 @@ export class Inbox {
     const placed = new Set<string>();
     const place = (entry: InboxEntry): void => {
       if (placed.has(entry.id)) return;
+      // Mark before recursing so a remote after_id cycle cannot overflow.
+      placed.add(entry.id);
       const pred = entry.afterId !== null ? byId.get(entry.afterId) : undefined;
       if (pred !== undefined && !placed.has(pred.id)) place(pred);
-      placed.add(entry.id);
       out.push(entry);
     };
     for (const entry of pending) place(entry);
@@ -136,15 +145,22 @@ export class Inbox {
     const ids: string[] = [];
     let size = 0;
     for (const entry of ordered) {
+      // Author is remote input too: cap it so one entry can never exceed the
+      // batch budget and stall delivery forever.
+      const author = entry.author.length > 80 ? `${entry.author.slice(0, 79)}…` : entry.author;
       const body =
         entry.text.length > MAX_ENTRY_CHARS
           ? `${entry.text.slice(0, MAX_ENTRY_CHARS - 1)}…`
           : entry.text;
-      const line =
+      let line =
         entry.kind === "comment"
-          ? `- ${entry.author} commented: ${body}`
-          : `- ${entry.author}: ${body}`;
-      if (size + line.length > MAX_BATCH_CHARS) break;
+          ? `- ${author} commented: ${body}`
+          : `- ${author}: ${body}`;
+      if (size + line.length > MAX_BATCH_CHARS) {
+        if (ids.length > 0) break;
+        // Guarantee the first entry is always deliverable.
+        line = line.slice(0, MAX_BATCH_CHARS - 1) + "…";
+      }
       lines.push(line);
       ids.push(entry.id);
       size += line.length;

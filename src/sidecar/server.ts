@@ -382,20 +382,27 @@ export class Sidecar {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        const deferred: (() => void)[] = [];
-        const response = await this.handleEvent(event, (fn) => deferred.push(fn));
+        const finishDeferred: (() => void)[] = [];
+        const closeDeferred: (() => void)[] = [];
+        const response = await this.handleEvent(event, (fn, mode = "close") => {
+          (mode === "finish" ? finishDeferred : closeDeferred).push(fn);
+        });
         sendJson(res, 200, response);
-        // 'close' fires on success AND client abort; 'finish' never fires
-        // when the client drops the connection before the flush completes.
-        res.on("close", () => {
-          for (const fn of deferred) {
+        const run = (fns: (() => void)[]): void => {
+          for (const fn of fns) {
             try {
               fn();
             } catch {
               // Fire-and-forget side effects must not crash the listener.
             }
           }
-        });
+        };
+        // 'finish' fires only when the response was fully written to the
+        // client; delivery marking wants that success-only semantics so an
+        // aborted forward redelivers instead of being lost. 'close' fires on
+        // success AND abort, which is right for flush/shutdown side effects.
+        res.on("finish", () => run(finishDeferred));
+        res.on("close", () => run(closeDeferred));
         return;
       }
       if (req.method === "POST" && url === "/share") {
@@ -426,7 +433,7 @@ export class Sidecar {
 
   async handleEvent(
     event: HookEventPayload,
-    defer?: (fn: () => void) => void,
+    defer?: (fn: () => void, mode?: "finish" | "close") => void,
   ): Promise<HookResponse> {
     const pidHint = event["delta_qwen_pid"];
     // SessionStart carries a fresh owner pid (http-delivered events cannot
@@ -455,6 +462,21 @@ export class Sidecar {
         : "unknown";
     this.log(`event ${name}`);
 
+    // Supersession is turn-scoped, not permanent: a new user-initiated turn
+    // reclaims the thread for the local agent. If the teammate still owns it,
+    // Delta re-fences the next append and the flag is set again. Without this,
+    // one takeover would deny tool use for the rest of the session and across
+    // resume while inbox context kept arriving the agent could not act on.
+    if (
+      name === "UserPromptSubmit" &&
+      typeof event["submitted_prompt"] === "string" &&
+      this.state.recording?.superseded === true
+    ) {
+      this.state.recording.superseded = false;
+      this.save();
+      this.log("user reclaimed the turn; supersession cleared");
+    }
+
     // Supersession gate (plan): once a teammate takes over the thread, deny
     // further tool calls with a reason the model sees. The user presses Esc;
     // qwen has no external cancellation API.
@@ -468,7 +490,7 @@ export class Sidecar {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
           permissionDecisionReason:
-            "A teammate took over this Delta thread. Stop working here; the user can press Esc to end the turn.",
+            "A teammate took over this Delta thread. Stop working here; the user can press Esc to end the turn, or send a new prompt to reclaim it.",
         },
       };
     }
@@ -498,7 +520,7 @@ export class Sidecar {
           },
         };
         const ids = batch.ids;
-        if (defer !== undefined) defer(() => this.inbox?.markDelivered(ids));
+        if (defer !== undefined) defer(() => this.inbox?.markDelivered(ids), "finish");
         else this.inbox.markDelivered(ids);
       }
     }

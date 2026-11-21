@@ -43,8 +43,8 @@ export class WatchView {
         this.inbox.markLive();
         return;
       case "item": {
-        const item = frame["item"] as WatchItem | undefined;
-        if (item === undefined) return;
+        const item = frame["item"] as WatchItem | null | undefined;
+        if (item == null) return;
         const id = str(item.id);
         if (id.length === 0) return;
         this.inbox.upsertItem(
@@ -68,8 +68,9 @@ export class WatchView {
       case "comment": {
         const comment = frame["comment"] as
           | { id?: unknown; text?: unknown; author?: { name?: unknown } | null }
+          | null
           | undefined;
-        if (comment === undefined) return;
+        if (comment == null) return;
         const id = str(comment.id);
         if (id.length === 0) return;
         this.inbox.upsertComment(id, str(comment.text), str(comment.author?.name) || "teammate");
@@ -110,6 +111,7 @@ export class Watcher {
   private child: ChildProcess | null = null;
   private stopped = false;
   private retryDelayMs = 1_000;
+  private restartTimer: NodeJS.Timeout | null = null;
   private readonly view: WatchView;
 
   constructor(
@@ -131,6 +133,11 @@ export class Watcher {
       this.opts.effects.log("watch: delta binary not found");
       return;
     }
+    // Never orphan a previous child (it holds --participate presence).
+    if (this.child !== null) {
+      this.child.kill("SIGTERM");
+      this.child = null;
+    }
     const args = [
       "--json",
       "thread",
@@ -148,6 +155,7 @@ export class Watcher {
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "ignore"] });
     child.on("error", (err) => {
       this.opts.effects.log(`watch: spawn failed: ${err.message}`);
+      if (this.child === child) this.child = null;
       this.scheduleRestart();
     });
     this.child = child;
@@ -161,32 +169,71 @@ export class Watcher {
       } catch {
         return;
       }
-      const error = frame["error"] as { reason?: unknown } | undefined;
-      if (error !== undefined) {
-        this.opts.effects.log(`watch: error ${str(error.reason)}; reconnecting`);
-        child.kill("SIGTERM");
-        return;
+      try {
+        this.handleFrame(frame, child);
+      } catch (err) {
+        // One malformed frame must never kill the sidecar.
+        this.opts.effects.log(`watch: frame handling failed: ${String(err)}`);
       }
-      this.retryDelayMs = 1_000;
-      this.view.apply(frame);
     });
     child.on("exit", (code, signal) => {
       this.opts.effects.log(`watch exited (${signal ?? "code " + String(code)})`);
-      this.child = null;
+      // Only clear if this is still the current child; a newer one may exist.
+      if (this.child === child) this.child = null;
       this.scheduleRestart();
     });
     this.opts.effects.log(`watch started for ${this.opts.threadId}`);
   }
 
+  private handleFrame(frame: Record<string, unknown>, child: ChildProcess): void {
+    const error = frame["error"] as
+      | { reason?: unknown; retryable?: unknown; retry_after_ms?: unknown }
+      | null
+      | undefined;
+    if (error != null) {
+      const retryable = error.retryable !== false;
+      if (!retryable) {
+        this.opts.effects.log(`watch: non-retryable error ${str(error.reason)}; giving up`);
+        this.stopped = true;
+        child.kill("SIGTERM");
+        return;
+      }
+      const after = typeof error.retry_after_ms === "number" ? error.retry_after_ms : 0;
+      this.opts.effects.log(`watch: error ${str(error.reason)}; reconnecting`);
+      if (after > 0) this.retryDelayMs = Math.max(this.retryDelayMs, after);
+      child.kill("SIGTERM");
+      return;
+    }
+    if (str(frame["type"]) === "watch_reset") {
+      this.opts.effects.log("watch: reset frame; reconnecting for a fresh snapshot");
+      child.kill("SIGTERM");
+      return;
+    }
+    // Backoff resets only once the stream is actually live, not on the
+    // ready/presence frames a failing CLI prints before dying.
+    if (str(frame["type"]) === "live") this.retryDelayMs = 1_000;
+    this.view.apply(frame);
+  }
+
   private scheduleRestart(): void {
     if (this.stopped) return;
+    // error + exit can both fire for one child; only one restart may pend.
+    if (this.restartTimer !== null) return;
     const delayMs = this.retryDelayMs;
     this.retryDelayMs = Math.min(this.retryDelayMs * 2, 30_000);
-    setTimeout(() => this.start(), delayMs).unref();
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this.start();
+    }, delayMs);
+    this.restartTimer.unref();
   }
 
   stop(): void {
     this.stopped = true;
+    if (this.restartTimer !== null) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     if (this.child !== null) {
       this.child.kill("SIGTERM");
       this.child = null;
