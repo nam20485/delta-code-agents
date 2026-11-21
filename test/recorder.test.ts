@@ -12,6 +12,11 @@ class MemorySink implements OutboxLike {
   get size(): number {
     return this.lines.length;
   }
+  maxPendingSequence(): number {
+    let max = 0;
+    for (const line of this.lines) if (line.sequence > max) max = line.sequence;
+    return max;
+  }
   async flush(): Promise<never> {
     throw new Error("not used in translation tests");
   }
@@ -22,6 +27,7 @@ interface Harness {
   sink: MemorySink;
   captureCalls: string[];
   saved: number;
+  recording: RecordingState;
 }
 
 function harness(): Harness {
@@ -50,7 +56,7 @@ function harness(): Harness {
       saved += 1;
     },
   });
-  return { recorder, sink, captureCalls, saved };
+  return { recorder, sink, captureCalls, saved, recording };
 }
 
 interface Emitted {
@@ -153,6 +159,97 @@ test("prompt dedupe and second turn get fresh sequences", () => {
   assert.equal(idles.length, 2);
   const errorNote = out.find((e) => e.sessionUpdate === "agent_message" && e.messageId === "a-m2");
   assert.equal(errorNote, undefined);
+});
+
+test("fenced supersession stops new turn content but keeps late output", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p1", submitted_prompt: "turn one" });
+  h.recording.superseded = true;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p2", submitted_prompt: "blocked" });
+  r.record({ hook_event_name: "PreToolUse", session_id: "s", tool_name: "write_file", tool_use_id: "t8" });
+  // Late output for the open turn still records with its original turnSequence.
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m9", displayed_text: "late", is_final: true });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "late done" });
+  const out = emitted(h);
+  assert.equal(out.filter((e) => e.sessionUpdate === "user_message").length, 1);
+  assert.equal(out.filter((e) => e.sessionUpdate === "tool_call_update").length, 0);
+  const late = out.find((e) => e.sessionUpdate === "agent_message" && e.messageId === "a-m9");
+  assert.notEqual(late, undefined);
+  assert.equal(late?.turnSequence, 1);
+  assert.equal(out[out.length - 1]?.state, "idle");
+});
+
+test("final MessageDisplay without an open turn reopens one; partials do not", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "orphan partial", is_final: false });
+  assert.equal(h.sink.size, 0);
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "orphan final", is_final: true });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "orphan final" });
+  const out = emitted(h);
+  assert.deepEqual(
+    out.map((e) => [e.sequence, e.turnSequence ?? null, e.sessionUpdate]),
+    [
+      [1, 1, "state_update"],
+      [2, 1, "agent_message"],
+      [3, 1, "state_update"],
+    ],
+  );
+});
+
+test("identical prompts without prompt_id both record with distinct ids", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", submitted_prompt: "again" });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "" });
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", submitted_prompt: "again" });
+  r.record({ hook_event_name: "Stop", session_id: "s", last_assistant_message: "" });
+  const users = emitted(h).filter((e) => e.sessionUpdate === "user_message");
+  assert.equal(users.length, 2);
+  assert.notEqual(users[0]?.messageId, users[1]?.messageId);
+});
+
+test("counter clamp: outbox sequences above the counter win on construction", () => {
+  const h = harness();
+  void h;
+  const sink = new MemorySink();
+  sink.add({ sequence: 7, update: { sessionUpdate: "state_update", state: "running" } });
+  const recording: RecordingState = {
+    enabled: true,
+    consent: "granted",
+    thread_id: "t",
+    next_sequence: 3,
+    superseded: false,
+    paused: false,
+    capture_enabled: true,
+    titled: false,
+  };
+  const r = new Recorder({
+    outbox: sink,
+    recording,
+    capture: { start: () => {}, stop: () => {} },
+    log: () => {},
+    save: () => {},
+  });
+  assert.equal(recording.next_sequence, 8); // clamped above the pending 7
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p1", submitted_prompt: "x" });
+  const seqs = sink.lines.slice(1).map((l) => l.sequence);
+  assert.deepEqual(seqs, [8, 9, 10]);
+});
+
+test("stop failure note uses a distinct id so the partial reply survives", () => {
+  const h = harness();
+  const r = h.recorder;
+  r.record({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "p1", submitted_prompt: "go" });
+  r.record({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m1", displayed_text: "partial answer", is_final: false });
+  r.record({ hook_event_name: "StopFailure", session_id: "s", error: "rate_limit" });
+  const out = emitted(h);
+  const partial = out.find((e) => e.sessionUpdate === "agent_message" && e.messageId === "a-m1");
+  const note = out.find((e) => e.sessionUpdate === "agent_message" && e.messageId === "a-error-1");
+  assert.notEqual(partial, undefined);
+  assert.notEqual(note, undefined);
+  assert.equal((partial?.content as { text: string }[])[0]?.text, "partial answer");
 });
 
 test("events before enablement and subagent events are dropped", () => {
