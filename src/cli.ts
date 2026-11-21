@@ -11,8 +11,9 @@ const USAGE = `delta-qwen CLI
 Usage: delta-qwen <command>   (slash commands call this via ~/.qwen/delta/cli.js)
 
 Commands:
-  doctor    Check the delta CLI, its thread contract, and local session state.
-  help      Show this help.
+  share [--confirm]   Share the current directory's Qwen session to your org
+  doctor              Check the delta CLI, thread contract, router, sessions
+  help                Show this help
 
 Slash commands (/delta-share, /delta-join, /delta-setup, /delta-inbox,
 /delta-org) arrive with Milestone 4.
@@ -20,10 +21,89 @@ Slash commands (/delta-share, /delta-join, /delta-setup, /delta-inbox,
 
 interface SessionStateSummary {
   session_id?: unknown;
+  cwd?: unknown;
   qwen_pid?: unknown;
   port?: unknown;
+  token?: unknown;
+  updated_at?: unknown;
   ended_at?: unknown;
 }
+
+/** Find the newest live session sidecar whose cwd matches `cwd`. */
+function findSessionByCwd(cwd: string): SessionStateSummary | null {
+  const root = sessionsRoot();
+  let best: SessionStateSummary | null = null;
+  let bestUpdated = "";
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const state = readJson<SessionStateSummary>(join(root, entry.name, "state.json"));
+      if (state === null) continue;
+      if (state["ended_at"] !== undefined) continue;
+      if (state["cwd"] !== cwd) continue;
+      const updated = typeof state["updated_at"] === "string" ? state["updated_at"] : "";
+      if (updated >= bestUpdated) {
+        best = state;
+        bestUpdated = updated;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return best;
+}
+
+interface ShareResponse {
+  status?: unknown;
+  message?: unknown;
+  thread_id?: unknown;
+  url?: unknown;
+  warning?: unknown;
+}
+
+async function share(confirm: boolean): Promise<number> {
+  const session = findSessionByCwd(process.cwd());
+  if (session === null || typeof session["port"] !== "number" || typeof session["token"] !== "string") {
+    console.error(
+      "No live delta-qwen session found for this directory. Start a Qwen Code " +
+        "session here first (its SessionStart hook creates the session state).",
+    );
+    return 1;
+  }
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${session["port"]}/share`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${session["token"]}`,
+      },
+      body: JSON.stringify({ confirm }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    console.error(`Cannot reach the session sidecar: ${String(err)}`);
+    return 1;
+  }
+  if (!res.ok) {
+    console.error(`Sidecar share failed (HTTP ${res.status}).`);
+    return 1;
+  }
+  const body = (await res.json()) as ShareResponse;
+  if (body["status"] === "consent_required") {
+    console.log(typeof body["message"] === "string" ? body["message"] : "Consent required.");
+    return 0;
+  }
+  if (body["status"] !== "shared") {
+    console.error(`Share failed: ${String(body["message"])}`);
+    return 1;
+  }
+  console.log(`Shared thread: ${String(body["thread_id"])}`);
+  if (typeof body["url"] === "string") console.log(`Open in Delta: ${body["url"]}`);
+  if (typeof body["warning"] === "string") console.log(`Note: ${body["warning"]}`);
+  return 0;
+}
+
 
 async function doctor(): Promise<number> {
   const bin = resolveDeltaBinary();
@@ -78,7 +158,9 @@ async function doctor(): Promise<number> {
 }
 
 const command = process.argv[2] ?? "help";
-if (command === "doctor") {
+if (command === "share") {
+  process.exit(await share(process.argv.includes("--confirm")));
+} else if (command === "doctor") {
   process.exit(await doctor());
 } else if (command === "help") {
   process.stdout.write(USAGE);
