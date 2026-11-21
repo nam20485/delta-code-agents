@@ -57,6 +57,21 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
+  if (args[0] === "thread" && args[1] === "watch") {
+    // Emit the fixture frames, then stay alive like the real watch until
+    // SIGTERM. FAKE_WATCH_FRAMES points at a JSONL file.
+    const framesFile = process.env["FAKE_WATCH_FRAMES"];
+    if (framesFile !== undefined && framesFile.length > 0) {
+      const frames = readFileSync(framesFile, "utf8");
+      process.stdout.write(frames.endsWith("\n") ? frames : `${frames}\n`);
+    }
+    const keepAlive = setInterval(() => {}, 1_000);
+    process.on("SIGTERM", () => {
+      clearInterval(keepAlive);
+      process.exitCode = 0;
+    });
+    return;
+  }
   const stdin = readFileSync(0, "utf8");
   const lines = stdin
     .split("\n")

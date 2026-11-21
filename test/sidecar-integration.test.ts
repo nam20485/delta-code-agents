@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,11 +54,11 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
   return predicate();
 }
 
-function sidecarPid(): number | null {
+function sidecarPid(sessionId = "it-1"): number | null {
   try {
     // Compiled entry is dist/src/sidecar/server.js; SessionStart spawns
     // carry --revive, so anchor on the session id with an optional flag.
-    const out = execFileSync("pgrep", ["-f", `sidecar/server\.js it-1( --revive)?$`], {
+    const out = execFileSync("pgrep", ["-f", `sidecar/server\\.js ${sessionId}( --revive)?$`], {
       encoding: "utf8",
     }).trim();
     const first = out.split("\n")[0];
@@ -144,6 +144,69 @@ test("share, kill/respawn continuity, clear, and retention", async () => {
     server.close();
     server.closeAllConnections();
     const pid = sidecarPid();
+    if (pid !== null) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("watch inbox injection, supersession deny, and mount swap", async () => {
+  const framesFile = join(home, "watch-frames.jsonl");
+  writeFileSync(
+    framesFile,
+    [
+      JSON.stringify({ type: "ready", thread_id: "fake-thread", producer: null }),
+      JSON.stringify({ type: "item", item: { id: "r1", kind: "agent_message", after_id: null, author: { name: "Ada" }, content: { text: "I fixed the parser on my side" } } }),
+      JSON.stringify({ type: "live" }),
+      JSON.stringify({ type: "worktrees", worktrees: [{ reference: "wt-ref#t=2", name: "delta" }] }),
+      JSON.stringify({ type: "producer.turn", sequence: 1, status: "superseded" }),
+    ].join("\n") + "\n",
+  );
+  process.env["FAKE_WATCH_FRAMES"] = framesFile;
+  const dir2 = join(home, "sessions", "it-2");
+  const { port, server } = await startRouter();
+  try {
+    await post(port, { session_id: "it-2", hook_event_name: "SessionStart", source: "startup", cwd: home, delta_qwen_pid: process.pid });
+    const state2 = () => loadState(dir2);
+    const sc2 = async (path: string, body: unknown) => {
+      const st = state2()!;
+      const res = await fetch(`http://127.0.0.1:${st.port}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${st.token}` },
+        body: JSON.stringify(body),
+      });
+      return (await res.json()) as Record<string, unknown>;
+    };
+    assert.equal((await sc2("/share", { confirm: true }))["status"], "shared");
+
+    // Watcher delivers Ada's item; the next user prompt carries it as
+    // additionalContext with a unique delivery id.
+    assert.ok(await waitFor(() => state2()?.recording?.superseded === true, 8_000), "superseded frame should land");
+    const promptRes = await post(port, { session_id: "it-2", hook_event_name: "UserPromptSubmit", prompt_id: "p1", submitted_prompt: "what changed?" });
+    const hookOut = promptRes["hookSpecificOutput"] as { additionalContext?: string } | undefined;
+    assert.notEqual(hookOut, undefined);
+    assert.match(String(hookOut?.additionalContext), /Ada: I fixed the parser/);
+    assert.match(String(hookOut?.additionalContext), /delivery="d-/);
+
+    // Supersession gate: PreToolUse is denied with a reason.
+    const denyRes = await post(port, { session_id: "it-2", hook_event_name: "PreToolUse", tool_name: "write_file", tool_use_id: "t9", tool_input: {} });
+    const deny = denyRes["hookSpecificOutput"] as { permissionDecision?: string; permissionDecisionReason?: string } | undefined;
+    assert.equal(deny?.permissionDecision, "deny");
+    assert.match(String(deny?.permissionDecisionReason), /took over/);
+
+    // worktrees frame swapped the thread mount.
+    const log = (await import("node:fs")).readFileSync(join(dir2, "sidecar.log"), "utf8");
+    assert.match(log, /swapped thread mount after worktrees change/);
+
+    // A second prompt does not re-inject the delivered item.
+    const promptRes2 = await post(port, { session_id: "it-2", hook_event_name: "UserPromptSubmit", prompt_id: "p2", submitted_prompt: "anything else?" });
+    assert.equal(promptRes2["hookSpecificOutput"], undefined);
+
+    await post(port, { session_id: "it-2", hook_event_name: "SessionEnd", reason: "prompt_input_exit" });
+    assert.ok(await waitFor(() => sidecarPid("it-2") === null, 5_000));
+  } finally {
+    delete process.env["FAKE_WATCH_FRAMES"];
+    server.close();
+    server.closeAllConnections();
+    const pid = sidecarPid("it-2");
     if (pid !== null) process.kill(pid, "SIGKILL");
   }
 });

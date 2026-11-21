@@ -1,0 +1,119 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Inbox } from "../src/sidecar/inbox.js";
+import { WatchView } from "../src/sidecar/watcher.js";
+
+function freshInbox(): Inbox {
+  return new Inbox(mkdtempSync(join(tmpdir(), "dq-inbox-")));
+}
+
+function effects(): { superseded: number; worktrees: number; logs: string[]; onSuperseded(): void; onWorktreesChanged(): void; log(l: string): void } {
+  const state = {
+    superseded: 0,
+    worktrees: 0,
+    logs: [] as string[],
+    onSuperseded() {
+      state.superseded += 1;
+    },
+    onWorktreesChanged() {
+      state.worktrees += 1;
+    },
+    log(l: string) {
+      state.logs.push(l);
+    },
+  };
+  return state;
+}
+
+test("watch frames feed the inbox; append extends, remove deletes", () => {
+  const inbox = freshInbox();
+  const view = new WatchView(inbox, effects());
+  view.apply({ type: "ready", thread_id: "t", producer: null });
+  view.apply({
+    type: "item",
+    item: { id: "i1", kind: "agent_message", after_id: null, author: { name: "Ada" }, content: { text: "Hello" } },
+  });
+  view.apply({ type: "item.append", id: "i1", text: " world" });
+  view.apply({ type: "live" });
+  const batch = inbox.nextBatch();
+  assert.notEqual(batch, null);
+  assert.match(batch!.text, /Ada: Hello world/);
+  assert.match(batch!.text, /delivery="d-/);
+  inbox.markDelivered(batch!.ids);
+  assert.equal(inbox.nextBatch(), null);
+  view.apply({ type: "remove", id: "i1" });
+  assert.equal(inbox.pendingCount(), 0);
+});
+
+test("every batch has a unique delivery id (qwen dedupe guard)", () => {
+  const inbox = freshInbox();
+  const view = new WatchView(inbox, effects());
+  view.apply({ type: "item", item: { id: "i1", after_id: null, author: { name: "Ada" }, content: { text: "same" } } });
+  view.apply({ type: "live" });
+  const first = inbox.nextBatch()!;
+  // Simulate a cancelled turn: not marked delivered, redelivered later.
+  const second = inbox.nextBatch()!;
+  assert.notEqual(first.deliveryId, second.deliveryId);
+  assert.notEqual(first.text, second.text);
+});
+
+test("after_id ordering holds unresolved predecessors until live", () => {
+  const inbox = freshInbox();
+  const view = new WatchView(inbox, effects());
+  view.apply({ type: "item", item: { id: "i2", after_id: "i1", author: { name: "Ada" }, content: { text: "second" } } });
+  // Predecessor i1 not in view (hidden own item): held before live.
+  assert.equal(inbox.pendingCount(), 0);
+  view.apply({ type: "live" });
+  assert.equal(inbox.pendingCount(), 1);
+  view.apply({ type: "item", item: { id: "i1", after_id: null, author: { name: "Bob" }, content: { text: "first" } } });
+  const batch = inbox.nextBatch()!;
+  const firstIdx = batch.text.indexOf("Bob: first");
+  const secondIdx = batch.text.indexOf("Ada: second");
+  assert.ok(firstIdx !== -1 && secondIdx !== -1 && firstIdx < secondIdx);
+});
+
+test("producer.turn superseded and worktrees frames fire effects", () => {
+  const inbox = freshInbox();
+  const fx = effects();
+  const view = new WatchView(inbox, fx);
+  view.apply({ type: "producer.turn", sequence: 1, status: "finished" });
+  assert.equal(fx.superseded, 0);
+  view.apply({ type: "producer.turn", sequence: 1, status: "superseded" });
+  assert.equal(fx.superseded, 1);
+  view.apply({ type: "worktrees", worktrees: [{ reference: "r#t=1", name: "delta" }] });
+  assert.equal(fx.worktrees, 1);
+  // Unknown frames are skipped, not fatal.
+  view.apply({ type: "future.frame", whatever: true });
+});
+
+test("comments enter the inbox and comment.remove deletes them", () => {
+  const inbox = freshInbox();
+  const view = new WatchView(inbox, effects());
+  view.apply({
+    type: "comment",
+    comment: { id: "c1", text: "Why this?", author: { name: "Ada" }, target: { item_id: "i1", kind: "transcript", quote: "Hello" } },
+  });
+  view.apply({ type: "live" });
+  const batch = inbox.nextBatch()!;
+  assert.match(batch.text, /Ada commented: Why this\?/);
+  view.apply({ type: "comment.remove", id: "c1" });
+  assert.equal(inbox.pendingCount(), 0);
+});
+
+test("delivered flags survive a reload (watch reconnect)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dq-inbox-"));
+  const inbox = new Inbox(dir);
+  const view = new WatchView(inbox, effects());
+  view.apply({ type: "item", item: { id: "i1", after_id: null, author: { name: "Ada" }, content: { text: "hello" } } });
+  view.apply({ type: "live" });
+  inbox.markDelivered(inbox.nextBatch()!.ids);
+  // Reconnect: fresh snapshot replays the same item into a new Inbox.
+  const reloaded = new Inbox(dir);
+  const view2 = new WatchView(reloaded, effects());
+  view2.apply({ type: "item", item: { id: "i1", after_id: null, author: { name: "Ada" }, content: { text: "hello" } } });
+  view2.apply({ type: "live" });
+  assert.equal(reloaded.nextBatch(), null);
+});
