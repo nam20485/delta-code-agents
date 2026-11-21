@@ -49,7 +49,11 @@ async function main(): Promise<void> {
     return;
   }
   if (args[0] === "org") {
-    process.stdout.write(`${JSON.stringify({ operation: "listed", organizations: [{ id: "org_fake", name: "Fake", current: true }] })}\n`);
+    if (args[1] === "current") {
+      process.stdout.write(`${JSON.stringify({ operation: "current", organization: { id: "org_fake", name: "Fake", current: true } })}\n`);
+    } else {
+      process.stdout.write(`${JSON.stringify({ operation: "listed", organizations: [{ id: "org_fake", name: "Fake", current: true }] })}\n`);
+    }
     process.exitCode = 0;
     return;
   }

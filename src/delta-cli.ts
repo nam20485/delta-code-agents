@@ -160,6 +160,15 @@ export function threadContract(): Promise<DeltaResult<ContractInfo>> {
   return runDelta<ContractInfo>(["thread", "contract"]);
 }
 
+/** The currently selected organization id, or null. Used to record an upload
+ * intent on private threads so records can append before sharing. */
+export async function currentOrganization(): Promise<string | null> {
+  const result = await runDelta<{ organization?: { id?: unknown } }>(["org", "current"]);
+  if (!result.ok) return null;
+  const id = result.value.organization?.id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 interface SpawnOutput {
   code: number | null;
   stdout: string;
