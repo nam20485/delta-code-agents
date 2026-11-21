@@ -245,8 +245,11 @@ rule).
   `UserPromptSubmit` `additionalContext` on the next turn** (never starts a
   turn itself) and viewable via `/delta-inbox`. Every injected block carries
   a unique delivery id: Qwen drops byte-identical context blocks after the
-  first delivery per session, unconditionally. A cancelled turn's delivery
-  stays undelivered. Fake-CLI frames fixture: delta-claude's
+  first delivery per session, unconditionally. Delivery is marked when the
+  hook response is written back to Qwen; a turn cancelled *after* that write
+  is unobservable from the sidecar (residual limitation — the unique id keeps
+  any later redelivery from being deduped away). Fake-CLI frames fixture:
+  delta-claude's
   `hooks/testing/fixtures/cli/thread-watch.frames.jsonl`.
 - `worktrees` frame → restart `thread mount` with the same owner, swap mounts.
 
@@ -369,7 +372,8 @@ in a throwaway Git repo:
    with user/agent/tool/turn records; receipts and retries.
 3. **Remote**: watch (full frame protocol) → inbox, `UserPromptSubmit`
    injection with delivery ids, supersession gate, `worktrees`-frame mount
-   swap.
+   swap. **Done** (live-verified: teammate append → injected context with
+   delivery id → no re-injection; deny gate and mount swap covered by tests).
 4. **Commands & policy**: setup/auto modes, CLI consent gate, join,
    pause/unshare, org commands, mid-session backfill.
 5. **Subagents** as child threads; polish, unit + fake-CLI suites.
