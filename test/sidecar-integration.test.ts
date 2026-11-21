@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -177,26 +177,37 @@ test("watch inbox injection, supersession deny, and mount swap", async () => {
     };
     assert.equal((await sc2("/share", { confirm: true }))["status"], "shared");
 
-    // Watcher delivers Ada's item; the next user prompt carries it as
-    // additionalContext with a unique delivery id.
+    // Watcher delivers Ada's item and the superseded frame.
     assert.ok(await waitFor(() => state2()?.recording?.superseded === true, 8_000), "superseded frame should land");
-    const promptRes = await post(port, { session_id: "it-2", hook_event_name: "UserPromptSubmit", prompt_id: "p1", submitted_prompt: "what changed?" });
-    const hookOut = promptRes["hookSpecificOutput"] as { additionalContext?: string } | undefined;
-    assert.notEqual(hookOut, undefined);
-    assert.match(String(hookOut?.additionalContext), /Ada: I fixed the parser/);
-    assert.match(String(hookOut?.additionalContext), /delivery="d-/);
 
-    // Supersession gate: PreToolUse is denied with a reason.
+    // Supersession gate: while superseded (before any reclaiming prompt),
+    // PreToolUse is denied with a reason.
     const denyRes = await post(port, { session_id: "it-2", hook_event_name: "PreToolUse", tool_name: "write_file", tool_use_id: "t9", tool_input: {} });
     const deny = denyRes["hookSpecificOutput"] as { permissionDecision?: string; permissionDecisionReason?: string } | undefined;
     assert.equal(deny?.permissionDecision, "deny");
     assert.match(String(deny?.permissionDecisionReason), /took over/);
 
     // worktrees frame swapped the thread mount.
-    const log = (await import("node:fs")).readFileSync(join(dir2, "sidecar.log"), "utf8");
+    const log = readFileSync(join(dir2, "sidecar.log"), "utf8");
     assert.match(log, /swapped thread mount after worktrees change/);
 
-    // A second prompt does not re-inject the delivered item.
+    // A user prompt carries the pending teammate activity as additionalContext
+    // with a unique delivery id, and reclaims the thread (clears supersession).
+    const promptRes = await post(port, { session_id: "it-2", hook_event_name: "UserPromptSubmit", prompt_id: "p1", submitted_prompt: "what changed?" });
+    const hookOut = promptRes["hookSpecificOutput"] as { additionalContext?: string } | undefined;
+    assert.notEqual(hookOut, undefined);
+    assert.match(String(hookOut?.additionalContext), /Ada: I fixed the parser/);
+    assert.match(String(hookOut?.additionalContext), /delivery="d-/);
+    const readLog = () => readFileSync(join(dir2, "sidecar.log"), "utf8");
+    assert.ok(await waitFor(() => readLog().includes("user reclaimed the turn"), 5_000));
+    assert.equal(state2()?.recording?.superseded, false);
+
+    // Supersession cleared: a tool call is no longer denied (Delta would
+    // re-fence the next append if the teammate still owned the thread).
+    const reclaimTool = await post(port, { session_id: "it-2", hook_event_name: "PreToolUse", tool_name: "read_file", tool_use_id: "t10", tool_input: {} });
+    assert.equal(reclaimTool["hookSpecificOutput"], undefined);
+
+    // A second prompt does not re-inject the already-delivered item.
     const promptRes2 = await post(port, { session_id: "it-2", hook_event_name: "UserPromptSubmit", prompt_id: "p2", submitted_prompt: "anything else?" });
     assert.equal(promptRes2["hookSpecificOutput"], undefined);
 
