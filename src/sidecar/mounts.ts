@@ -66,9 +66,12 @@ export class Mounts {
       detached: false,
     });
     // A failed spawn (e.g. missing exec bit) must not crash the sidecar.
+    // 'exit' never fires for spawn failures, so remove the entry here or
+    // hasChildren would report a child that never ran.
     child.on("error", (err) => {
       this.opts.log(`${label}: spawn failed: ${err.message}`);
-      this.prune();
+      const index = this.children.findIndex((entry) => entry.child === child);
+      if (index !== -1) this.children.splice(index, 1);
     });
     this.children.push({ label, child });
     child.on("exit", (code, signal) => {

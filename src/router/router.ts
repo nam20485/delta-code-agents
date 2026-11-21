@@ -175,9 +175,11 @@ export class Router {
     const previous = this.chains.get(key) ?? Promise.resolve();
     const next = previous.catch(() => {}).then(() => this.handleEventInner(event));
     this.chains.set(key, next);
-    void next.finally(() => {
-      if (this.chains.get(key) === next) this.chains.delete(key);
-    });
+    void next
+      .finally(() => {
+        if (this.chains.get(key) === next) this.chains.delete(key);
+      })
+      .catch(() => {});
     return next;
   }
 
