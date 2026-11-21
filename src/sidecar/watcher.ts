@@ -101,9 +101,11 @@ export class WatchView {
         // Turn/presence replace latest state; not needed for recording.
         return;
       case "children": {
-        this.childThreads.clear();
         const list = frame["children"];
         if (Array.isArray(list)) {
+          // Only a usable snapshot replaces the map; an off-contract frame
+          // (null/non-array) must not wipe tracked subthreads.
+          this.childThreads.clear();
           for (const entry of list) {
             if (entry !== null && typeof entry === "object") {
               const child = entry as Record<string, unknown>;

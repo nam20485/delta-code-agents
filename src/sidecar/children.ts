@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { DELTA_SOURCE, PRODUCER_NAME } from "../lib/constants.js";
 import { runDelta } from "../delta-cli.js";
+import { atomicWriteJson, readJson } from "../lib/fsx.js";
 import { Outbox } from "./outbox.js";
 import { Recorder } from "./recorder.js";
 import type { RecordingState } from "./state.js";
@@ -13,9 +14,16 @@ interface Child {
   recorder: Recorder;
 }
 
-function safeName(agentId: string): string {
-  return agentId.replace(/[^A-Za-z0-9._-]/g, "_");
+interface ChildPersisted {
+  next_sequence: number;
 }
+
+/** Collision-safe filename component for an agent id (a:b vs a/b differ). */
+function safeName(agentId: string): string {
+  return encodeURIComponent(agentId);
+}
+
+const CREATE_RETRY_MS = 30_000;
 
 /**
  * Records Qwen subagents as child threads under the session's thread (plan:
@@ -23,24 +31,34 @@ function safeName(agentId: string): string {
  * `--parent --shared-worktrees --external-id <session>:<agent_id>` and gets
  * its own Recorder + outbox; events carrying `agent_id` route here instead of
  * the parent recorder. Capture is disabled for children (their edits still
- * sync through the shared worktrees, just unattributed).
+ * sync through the shared worktrees, just unattributed). Child sequence
+ * counters persist per generation so a restart never reuses a sequence.
  */
 export class ChildThreads {
   private readonly children = new Map<string, Child>();
   private readonly creating = new Map<string, Promise<Child | null>>();
+  private readonly failedUntil = new Map<string, number>();
 
   constructor(
     private readonly opts: {
       dir: string;
       parentThreadId: () => string;
       externalId: () => string;
+      generation: () => number;
       log: (line: string) => void;
     },
   ) {}
 
+  private childFile(agentId: string, suffix: string): string {
+    return join(this.opts.dir, `child-${this.opts.generation()}-${safeName(agentId)}.${suffix}`);
+  }
+
   private async ensureChild(agentId: string, agentType: string): Promise<Child | null> {
     const existing = this.children.get(agentId);
     if (existing !== undefined) return existing;
+    // Cap respawn churn while create keeps failing (auth/server outage).
+    const deadline = this.failedUntil.get(agentId);
+    if (deadline !== undefined && Date.now() < deadline) return null;
     const inflight = this.creating.get(agentId);
     if (inflight !== undefined) return inflight;
     const parent = this.opts.parentThreadId();
@@ -49,7 +67,12 @@ export class ChildThreads {
     this.creating.set(agentId, promise);
     try {
       const child = await promise;
-      if (child !== null) this.children.set(agentId, child);
+      if (child !== null) {
+        this.children.set(agentId, child);
+        this.failedUntil.delete(agentId);
+      } else {
+        this.failedUntil.set(agentId, Date.now() + CREATE_RETRY_MS);
+      }
       return child;
     } finally {
       this.creating.delete(agentId);
@@ -78,23 +101,27 @@ export class ChildThreads {
       return null;
     }
     const reference = result.value["reference"];
+    const stateFile = this.childFile(agentId, "state.json");
+    const saved = readJson<ChildPersisted>(stateFile);
     const recording: RecordingState = {
       enabled: true,
       consent: "granted",
       thread_id: reference,
-      next_sequence: 1,
+      next_sequence: typeof saved?.next_sequence === "number" ? saved.next_sequence : 1,
       superseded: false,
       paused: false,
       capture_enabled: false,
       titled: false,
     };
-    const outbox = new Outbox(join(this.opts.dir, `child-${safeName(agentId)}.jsonl`));
+    const outbox = new Outbox(this.childFile(agentId, "jsonl"));
     const recorder = new Recorder({
       outbox,
       recording,
       capture: { start: () => {}, stop: () => {} },
       log: (line) => this.opts.log(`[${agentId}] ${line}`),
-      save: () => {},
+      save: () => {
+        atomicWriteJson(stateFile, { next_sequence: recording.next_sequence });
+      },
     });
     this.opts.log(`child thread ${reference} for ${agentType} (${agentId})`);
     return { reference, externalId, recording, outbox, recorder };
@@ -130,9 +157,14 @@ export class ChildThreads {
     }
   }
 
+  /** Flush every child; one failing child must not starve the others. */
   async flushAll(): Promise<void> {
     for (const child of this.children.values()) {
-      await this.flushChild(child);
+      try {
+        await this.flushChild(child);
+      } catch (err) {
+        this.opts.log(`child flush failed: ${String(err)}`);
+      }
     }
   }
 

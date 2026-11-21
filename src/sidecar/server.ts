@@ -217,14 +217,18 @@ export class Sidecar {
         },
       });
       this.watcher.start();
-      this.children = new ChildThreads({
-        dir: this.dir,
-        parentThreadId: () => this.recordingState().thread_id,
-        externalId: () => this.state.external_id,
-        log: (line) => this.log(line),
-      });
+      if (this.children === null) {
+        this.children = new ChildThreads({
+          dir: this.dir,
+          parentThreadId: () => this.recordingState().thread_id,
+          externalId: () => this.state.external_id,
+          generation: () => this.state.generation,
+          log: (line) => this.log(line),
+        });
+      }
       this.flushTimer = setInterval(() => {
         void this.tryFlush();
+        void this.children?.flushAll().catch(() => {});
       }, FLUSH_RETRY_MS);
       this.flushTimer.unref();
     }
@@ -446,6 +450,14 @@ export class Sidecar {
       return;
     }
     for (const ev of buffered) {
+      if (typeof ev["agent_id"] === "string") {
+        const children = this.ensureChildren();
+        if (children !== null) {
+          const agentType = typeof ev["agent_type"] === "string" ? ev["agent_type"] : "subagent";
+          void children.record(ev["agent_id"], agentType, ev).catch(() => {});
+        }
+        continue;
+      }
       recorder.record(ev);
       const n = ev["hook_event_name"];
       if (n === "Stop" || n === "StopFailure" || n === "SessionEnd") void this.tryFlush();
@@ -517,6 +529,7 @@ export class Sidecar {
     this.watcher = null;
     this.mounts?.stopAll();
     this.mounts = null;
+    void this.children?.flushAll().catch(() => {});
     this.recorder = null;
     this.outbox = null;
     this.inbox = null;
@@ -589,6 +602,7 @@ export class Sidecar {
     this.watcher = null;
     this.mounts?.stopAll();
     this.mounts = null;
+    void this.children?.flushAll().catch(() => {});
     this.recorder = null;
     this.outbox = null;
     this.inbox = null;
@@ -608,6 +622,7 @@ export class Sidecar {
         dir: this.dir,
         parentThreadId: () => this.recordingState().thread_id,
         externalId: () => this.state.external_id,
+        generation: () => this.state.generation,
         log: (line) => this.log(line),
       });
     }
@@ -868,6 +883,16 @@ export class Sidecar {
       };
     }
 
+    // Buffer events that arrive while an enable is in flight (recording not
+    // yet enabled); they are replayed once the recorder exists, not dropped.
+    // SessionEnd is never buffered: it must always reach teardown even if the
+    // whole session lived inside the enable window (e.g. a one-shot qwen -p).
+    // Subagent events buffer too and are routed to children on replay.
+    if (this.enableInFlight !== null && name !== "SessionEnd") {
+      this.eventBuffer.push(event as Record<string, unknown>);
+      return {};
+    }
+
     // Subagent events (carrying agent_id) record into child threads, not the
     // parent recorder. Route them directly (fire-and-forget); before recording
     // is enabled there is no parent thread, so they are dropped.
@@ -875,17 +900,12 @@ export class Sidecar {
       const children = this.ensureChildren();
       if (children !== null) {
         const agentType = typeof event["agent_type"] === "string" ? event["agent_type"] : "subagent";
-        void children.record(event["agent_id"], agentType, event as Record<string, unknown>);
+        // Catch: a disk error during a child record/flush must never become an
+        // unhandled rejection that kills the sidecar (and parent recording).
+        void children
+          .record(event["agent_id"], agentType, event as Record<string, unknown>)
+          .catch((err) => this.log(`child record failed: ${String(err)}`));
       }
-      return {};
-    }
-
-    // Buffer events that arrive while an enable is in flight (recording not
-    // yet enabled); they are replayed once the recorder exists, not dropped.
-    // SessionEnd is never buffered: it must always reach teardown even if the
-    // whole session lived inside the enable window (e.g. a one-shot qwen -p).
-    if (this.enableInFlight !== null && name !== "SessionEnd") {
-      this.eventBuffer.push(event as Record<string, unknown>);
       return {};
     }
 

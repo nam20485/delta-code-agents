@@ -53,7 +53,7 @@ test("router multiplexes a session end to end", async () => {
     let pid: number | null = null;
     // Poll generously for loaded CI runners; re-send SessionStart periodically
     // (the sidecar pid lock prevents a slow boot from becoming two writers).
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 300; i++) {
       pid = readPid();
       if (pid === process.pid) break;
       if (i % 20 === 19) await post(port, startBody);
@@ -73,9 +73,12 @@ test("router multiplexes a session end to end", async () => {
       {},
     );
 
-    // SessionEnd tears the sidecar and its state dir down.
-    await post(port, { session_id: "rt-1", hook_event_name: "SessionEnd", reason: "prompt_input_exit" });
-    for (let i = 0; i < 150 && existsSync(dir); i++) {
+    // SessionEnd tears the sidecar and its state dir down. Re-send periodically
+    // in case a forward was dropped on a loaded runner.
+    const endBody = { session_id: "rt-1", hook_event_name: "SessionEnd", reason: "prompt_input_exit" };
+    await post(port, endBody);
+    for (let i = 0; i < 300 && existsSync(dir); i++) {
+      if (i % 20 === 19) await post(port, endBody);
       await delay(100);
     }
     assert.equal(existsSync(dir), false);
