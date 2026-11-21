@@ -385,7 +385,13 @@ in a throwaway Git repo:
    `.git/info/exclude`; policy auto-apply on SessionStart; qwen-transcript
    backfill; per-`/clear` external-id suffix. Pause/unshare and the
    policy-gated `--acknowledge` (still local-ack) carry into M5 polish.
-5. **Subagents** as child threads; polish, unit + fake-CLI suites.
+5. **Subagents** as child threads; polish, unit + fake-CLI suites. **Done**:
+   `ChildThreads` creates idempotent `--parent --shared-worktrees` children
+   (`<session>:<agent_id>`), routes `agent_id` events to per-child
+   recorders/outboxes, `SubagentStop` → child final answer + idle; watch
+   `children`/`child`/`child.remove` frames tracked; policy-gated
+   `--acknowledge` (private→local, shared→server). Live-verified: an Explorer
+   subagent recorded as a child thread under the session.
 6. **Docs & release**: README (install via `qwen extensions install <repo
    URL>`), AGENTS.md, release notes; live e2e pass per Verification.
 
