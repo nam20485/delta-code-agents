@@ -9,6 +9,8 @@ import { ensureDir } from "../lib/fsx.js";
 import { pidAlive } from "../lib/proc.js";
 import { DELTA_SOURCE, PRODUCER_NAME } from "../lib/constants.js";
 import { REQUIRED_CONTRACT, runDelta, threadContract } from "../delta-cli.js";
+import { readPolicy, writePolicy, isSyncMode, type ProjectPolicy, type SyncMode } from "../policy.js";
+import { backfillTranscript } from "../backfill.js";
 import { sessionDir, sessionsRoot } from "../lib/paths.js";
 import { loadState, newState, saveState, type RecordingState, type SessionState } from "./state.js";
 import { Outbox, type FlushTarget } from "./outbox.js";
@@ -169,21 +171,7 @@ export class Sidecar {
     if (recording === undefined || !recording.enabled) return null;
     if (this.recorder === null) {
       this.outbox = new Outbox(join(this.dir, "outbox.jsonl"));
-      this.mounts = new Mounts({
-        threadId: recording.thread_id,
-        externalId: this.state.external_id,
-        sessionId: this.state.session_id,
-        ownerPid: () => this.state.qwen_pid,
-        captureEnabled: () => this.state.recording?.capture_enabled !== false,
-        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
-        log: (line) => this.log(line),
-        onCaptureUnavailable: () => {
-          if (this.state.recording !== undefined) {
-            this.state.recording.capture_enabled = false;
-            this.save();
-          }
-        },
-      });
+      const mounts = this.ensureMounts();
       this.recorder = new Recorder({
         outbox: this.outbox,
         recording,
@@ -199,9 +187,9 @@ export class Sidecar {
       if (
         typeof recording.worktree_reference === "string" &&
         this.state.cwd.length > 0 &&
-        !this.mounts.hasChildren
+        !mounts.hasChildren
       ) {
-        void this.mounts.restore(recording.worktree_reference, this.state.cwd);
+        void mounts.restore(recording.worktree_reference, this.state.cwd);
       }
       // Remote activity: watch the thread, feed the inbox, react to
       // supersession and attachment changes.
@@ -282,8 +270,8 @@ export class Sidecar {
     }
   }
 
-  /** CLI-driven share flow (`cli.ts share [--confirm]`). */
-  share(confirm: boolean): Promise<ShareResponse> {
+  /** CLI-driven share flow (`cli.ts share [--confirm] [emails...]`). */
+  share(confirm: boolean, emails: string[] = []): Promise<ShareResponse> {
     if (this.shareInFlight !== null) {
       // A confirming caller must not receive the unconfirmed call's answer.
       if (confirm !== this.shareInFlightConfirm) {
@@ -295,13 +283,13 @@ export class Sidecar {
       return this.shareInFlight;
     }
     this.shareInFlightConfirm = confirm;
-    this.shareInFlight = this.doShare(confirm).finally(() => {
+    this.shareInFlight = this.doShare(confirm, emails).finally(() => {
       this.shareInFlight = null;
     });
     return this.shareInFlight;
   }
 
-  private async doShare(confirm: boolean): Promise<ShareResponse> {
+  private async doShare(confirm: boolean, emails: string[]): Promise<ShareResponse> {
     const recording = this.recordingState();
     if (recording.consent !== "granted") {
       if (!confirm) {
@@ -312,36 +300,79 @@ export class Sidecar {
       recording.consent = "granted";
       this.save();
     }
-    if (!recording.enabled) {
-      const contract = await threadContract();
-      if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
-        return {
-          status: "error",
-          message: contract.ok
-            ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
-            : contract.error.message,
-        };
-      }
-      const created = await runDeltaCreate(this.state.external_id);
-      if (!created.ok) return { status: "error", message: created.error };
-      recording.thread_id = created.threadId;
-      recording.enabled = true;
-      this.save();
-      if (this.state.cwd.length > 0) {
-        this.ensureRecorder();
-        const result = await this.mounts?.adoptCheckout(this.state.cwd);
-        if (result !== undefined && result.ok && typeof result.reference === "string") {
-          recording.worktree_reference = result.reference;
-          this.save();
-        } else if (result !== undefined && !result.ok) {
-          this.log(`conversation-only recording: ${result.reason ?? "unknown"}`);
-        }
+    const enabled = await this.enableRecording();
+    if (!enabled.ok) return { status: "error", message: enabled.error };
+    if (emails.length > 0) {
+      const invited = await runDelta<{ results?: unknown }>([
+        "thread",
+        "invite",
+        recording.thread_id,
+        ...emails,
+      ]);
+      if (!invited.ok) return { status: "error", message: invited.error.message, thread_id: recording.thread_id };
+      return {
+        status: "shared",
+        thread_id: recording.thread_id,
+        message: `invited: ${emails.join(", ")}`,
+      };
+    }
+    const shared = await runDeltaShare(recording.thread_id);
+    return this.shareResponse(shared);
+  }
+
+  /** Contract gate + idempotent thread create + checkout adoption. */
+  private async enableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const recording = this.recordingState();
+    if (recording.enabled) return { ok: true };
+    const contract = await threadContract();
+    if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
+      return {
+        ok: false,
+        error: contract.ok
+          ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
+          : contract.error.message,
+      };
+    }
+    const created = await runDeltaCreate(this.state.external_id);
+    if (!created.ok) return { ok: false, error: created.error };
+    recording.thread_id = created.threadId;
+    recording.enabled = true;
+    this.save();
+    if (this.state.cwd.length > 0) {
+      this.ensureRecorder();
+      const result = await this.mounts?.adoptCheckout(this.state.cwd);
+      if (result !== undefined && result.ok && typeof result.reference === "string") {
+        recording.worktree_reference = result.reference;
+        this.save();
+      } else if (result !== undefined && !result.ok) {
+        this.log(`conversation-only recording: ${result.reason ?? "unknown"}`);
       }
     }
     this.ensureRecorder();
-    const shared = await runDeltaShare(recording.thread_id);
+    // Mid-session share: backfill the prior conversation from the transcript
+    // before live records continue (best-effort; history without turnSequence).
+    if (
+      this.state.transcript_path !== undefined &&
+      this.outbox !== null &&
+      recording.next_sequence === 1
+    ) {
+      const updates = backfillTranscript(this.state.transcript_path);
+      for (const update of updates) {
+        this.outbox.add({ sequence: recording.next_sequence, update });
+        recording.next_sequence += 1;
+      }
+      if (updates.length > 0) {
+        this.save();
+        this.log(`backfilled ${updates.length} historical records`);
+      }
+    }
+    return { ok: true };
+  }
+
+  private shareResponse(shared: { ok: true; url: string | null } | { ok: false; error: string }): ShareResponse {
+    const recording = this.recordingState();
     const warning =
-      this.state.recording?.capture_enabled === false
+      recording.capture_enabled === false
         ? "this delta CLI attributes edits only for claude-code sessions; edits will appear unattributed"
         : undefined;
     const response: ShareResponse = {
@@ -352,6 +383,140 @@ export class Sidecar {
     if (!shared.ok) response.message = shared.error;
     if (warning !== undefined) response.warning = warning;
     return response;
+  }
+
+  /**
+   * Apply the repository sync policy on session start (plan: Project policy).
+   * `manual` records nothing until /delta-share; `private` records locally;
+   * `team` also shares with the org. Choosing a non-manual mode via /delta-setup
+   * is the user's consent, so it is granted here.
+   */
+  async applyPolicy(): Promise<ShareResponse | null> {
+    if (this.state.cwd.length === 0) return null;
+    const policy = readPolicy(this.state.cwd);
+    if (policy.mode === "manual") return null;
+    const recording = this.recordingState();
+    recording.consent = "granted";
+    this.save();
+    const enabled = await this.enableRecording();
+    if (!enabled.ok) return { status: "error", message: enabled.error };
+    if (policy.mode === "team") {
+      const shared = await runDeltaShare(recording.thread_id);
+      return this.shareResponse(shared);
+    }
+    return { status: "shared", thread_id: recording.thread_id };
+  }
+
+  /** /delta-setup: persist the policy and apply it immediately. */
+  async setup(mode: SyncMode, organization?: string): Promise<ShareResponse> {
+    if (this.state.cwd.length === 0) {
+      return { status: "error", message: "session has no working directory" };
+    }
+    const policy: ProjectPolicy = { mode };
+    if (organization !== undefined) policy.organization = organization;
+    writePolicy(this.state.cwd, policy);
+    this.log(`policy set: ${mode}`);
+    if (mode === "manual") {
+      return { status: "shared", thread_id: this.recordingState().thread_id, message: "manual mode: recording only after /delta-share" };
+    }
+    const applied = await this.applyPolicy();
+    return applied ?? { status: "shared", thread_id: this.recordingState().thread_id };
+  }
+
+  /** /delta-pause: stop recording/sync for this session, keeping the thread. */
+  pause(): ShareResponse {
+    const recording = this.recordingState();
+    recording.enabled = false;
+    this.save();
+    this.watcher?.stop();
+    this.mounts?.stopAll();
+    this.log("recording paused");
+    return { status: "shared", thread_id: recording.thread_id, message: "paused; /delta-share resumes in the same thread" };
+  }
+
+  /** /delta-unshare: make the thread private, keeping sync and invitations. */
+  async unshare(): Promise<ShareResponse> {
+    const recording = this.recordingState();
+    if (recording.thread_id.length === 0) {
+      return { status: "error", message: "no thread to unshare" };
+    }
+    const result = await runDelta<{ operation?: unknown }>(["thread", "unshare", recording.thread_id]);
+    if (!result.ok) return { status: "error", message: result.error.message };
+    return { status: "shared", thread_id: recording.thread_id, message: "thread is now private (explicit invitations retained)" };
+  }
+
+  /** /delta-inbox: show pending remote activity without delivering it. */
+  inboxPeek(): { pending: number; text: string } {
+    if (this.inbox === null) return { pending: 0, text: "(no remote activity)" };
+    const batch = this.inbox.nextBatch();
+    if (batch === null) return { pending: 0, text: "(no pending remote activity)" };
+    // Peek only: do not mark delivered; the next user turn injects it.
+    return { pending: this.inbox.pendingCount(), text: batch.text };
+  }
+
+  /** /delta-join <link>: check access, mount the thread's files, return dir. */
+  async joinThread(link: string): Promise<{ status: string; directory?: string; message?: string }> {
+    const status = await runDelta<{ access?: { state?: unknown } }>([
+      "thread",
+      "status",
+      link,
+      "--source",
+      DELTA_SOURCE,
+      "--external-id",
+      this.state.external_id,
+    ]);
+    if (!status.ok) {
+      return { status: "error", message: `cannot access thread: ${status.error.message}` };
+    }
+    const mounts = this.ensureMounts();
+    const joined = await mounts.join(link);
+    if (!joined.ok) return { status: "error", message: joined.error };
+    this.log(`joined thread; checkout at ${joined.directory}`);
+    return {
+      status: "joined",
+      directory: joined.directory,
+      message: `Run qwen's /cd ${joined.directory} to work in the thread's checkout.`,
+    };
+  }
+
+  /** `/clear`: bind a fresh thread for the new conversation, leaving the old
+   * one idle. Best-effort flush of the old outbox first so undelivered records
+   * still reach the old thread. */
+  private resetForClear(): void {
+    void this.tryFlush();
+    this.state.clear_count += 1;
+    this.state.external_id = `${this.state.session_id}-c${this.state.clear_count}`;
+    this.watcher?.stop();
+    this.watcher = null;
+    this.mounts?.stopAll();
+    this.mounts = null;
+    this.recorder = null;
+    this.outbox = null;
+    this.inbox = null;
+    delete this.state.recording;
+    this.save();
+    this.log(`clear: new conversation external id ${this.state.external_id}`);
+  }
+
+  private ensureMounts(): Mounts {    if (this.mounts === null) {
+      const recording = this.recordingState();
+      this.mounts = new Mounts({
+        threadId: recording.thread_id,
+        externalId: this.state.external_id,
+        sessionId: this.state.session_id,
+        ownerPid: () => this.state.qwen_pid,
+        captureEnabled: () => this.state.recording?.capture_enabled !== false,
+        sessionActive: () => !this.shuttingDown && this.state.ended_at === undefined,
+        log: (line) => this.log(line),
+        onCaptureUnavailable: () => {
+          if (this.state.recording !== undefined) {
+            this.state.recording.capture_enabled = false;
+            this.save();
+          }
+        },
+      });
+    }
+    return this.mounts;
   }
 
   async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -411,14 +576,82 @@ export class Sidecar {
           return;
         }
         const body = await readBody(req);
-        let request: { confirm?: unknown };
+        let request: { confirm?: unknown; emails?: unknown };
         try {
-          request = JSON.parse(body.toString("utf8")) as { confirm?: unknown };
+          request = JSON.parse(body.toString("utf8")) as { confirm?: unknown; emails?: unknown };
         } catch {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        sendJson(res, 200, await this.share(request["confirm"] === true));
+        const emails = Array.isArray(request["emails"])
+          ? request["emails"].filter((e): e is string => typeof e === "string")
+          : [];
+        sendJson(res, 200, await this.share(request["confirm"] === true, emails));
+        return;
+      }
+      if (req.method === "POST" && url === "/setup") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const body = await readBody(req);
+        let request: { mode?: unknown; organization?: unknown };
+        try {
+          request = JSON.parse(body.toString("utf8")) as { mode?: unknown; organization?: unknown };
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (!isSyncMode(request["mode"])) {
+          sendJson(res, 400, { error: "mode must be private, team, or manual" });
+          return;
+        }
+        const org = typeof request["organization"] === "string" ? request["organization"] : undefined;
+        sendJson(res, 200, await this.setup(request["mode"], org));
+        return;
+      }
+      if (req.method === "POST" && url === "/join") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const body = await readBody(req);
+        let request: { link?: unknown };
+        try {
+          request = JSON.parse(body.toString("utf8")) as { link?: unknown };
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (typeof request["link"] !== "string" || request["link"].length === 0) {
+          sendJson(res, 400, { error: "link is required" });
+          return;
+        }
+        sendJson(res, 200, await this.joinThread(request["link"]));
+        return;
+      }
+      if (req.method === "POST" && url === "/pause") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, this.pause());
+        return;
+      }
+      if (req.method === "POST" && url === "/unshare") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, await this.unshare());
+        return;
+      }
+      if (req.method === "GET" && url === "/inbox") {
+        if (!tokenMatches(this.state.token, bearerToken(req))) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        sendJson(res, 200, this.inboxPeek());
         return;
       }
       sendJson(res, 404, { error: "not found" });
@@ -456,11 +689,33 @@ export class Sidecar {
       this.state.cwd = event["cwd"];
       this.save();
     }
+    if (
+      typeof event["transcript_path"] === "string" &&
+      event["transcript_path"].length > 0 &&
+      this.state.transcript_path === undefined
+    ) {
+      this.state.transcript_path = event["transcript_path"];
+      this.save();
+    }
     const name =
       typeof event["hook_event_name"] === "string"
         ? (event["hook_event_name"] as string)
         : "unknown";
     this.log(`event ${name}`);
+
+    // `/clear` starts a new conversation: suffix the external id with a clear
+    // counter so the next recording binds a fresh thread (the old thread is
+    // left idle, never finalized). `compact` keeps the same conversation.
+    if (name === "SessionStart" && event["source"] === "clear") {
+      this.resetForClear();
+    }
+    // Apply the repository sync policy on session start (not on compact, which
+    // continues the same recording). Deferred so the response is not blocked
+    // by the delta calls enableRecording makes.
+    if (name === "SessionStart" && event["source"] !== "compact") {
+      if (defer !== undefined) defer(() => void this.applyPolicy());
+      else void this.applyPolicy();
+    }
 
     // Supersession is turn-scoped, not permanent: a new user-initiated turn
     // reclaims the thread for the local agent. If the teammate still owns it,

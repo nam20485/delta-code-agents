@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
 import { DELTA_SOURCE, EDIT_TOOLS } from "../lib/constants.js";
 import { resolveDeltaBinary, runDelta } from "../delta-cli.js";
 
@@ -67,6 +68,58 @@ export class Mounts {
     }
     this.spawnDelta("thread-mount", ["thread", "mount", "--owner", this.opts.sessionId, this.opts.threadId]);
     this.opts.log("swapped thread mount after worktrees change");
+  }
+
+  /**
+   * /delta-join: mount a shared thread's worktrees into a fresh directory and
+   * return it once ready. `--join` reports an explicit join, not background
+   * maintenance. The mount child stays running for the session.
+   */
+  join(link: string): Promise<{ ok: true; directory: string } | { ok: false; error: string }> {
+    const bin = resolveDeltaBinary();
+    if (bin === null) return Promise.resolve({ ok: false, error: "delta CLI not found" });
+    return new Promise((resolve) => {
+      const child = spawn(
+        bin,
+        ["--json", "thread", "mount", link, "--owner", this.opts.sessionId, "--join"],
+        { stdio: ["ignore", "pipe", "ignore"] },
+      );
+      let settled = false;
+      const finish = (result: { ok: true; directory: string } | { ok: false; error: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish({ ok: false, error: "join timed out waiting for the mount directory" });
+      }, 60_000);
+      child.on("error", (err) => finish({ ok: false, error: err.message }));
+      const lines = createInterface({ input: child.stdout! });
+      lines.on("line", (line) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("{")) return;
+        try {
+          const frame = JSON.parse(trimmed) as { directory?: unknown; error?: { message?: unknown } };
+          if (typeof frame.directory === "string") {
+            this.children.push({ label: "join-mount", child });
+            child.on("exit", (code, signal) => {
+              this.opts.log(`join-mount exited (${signal ?? "code " + String(code)})`);
+              this.prune();
+            });
+            finish({ ok: true, directory: frame.directory });
+          } else if (frame.error !== undefined) {
+            finish({ ok: false, error: String(frame.error.message ?? "join failed") });
+          }
+        } catch {
+          // Not the ready line.
+        }
+      });
+      child.on("exit", (code) => {
+        finish({ ok: false, error: `join mount exited early (code ${String(code)})` });
+      });
+    });
   }
 
   private spawnDelta(label: string, args: string[]): ChildProcess | null {

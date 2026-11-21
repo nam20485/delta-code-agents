@@ -15,6 +15,8 @@ export interface SessionState {
   token: string;
   /** Session working directory (SessionStart payload), for cli discovery. */
   cwd: string;
+  /** Qwen transcript JSONL path, for mid-session share backfill. */
+  transcript_path?: string;
   created_at: string;
   updated_at: string;
   ended_at?: string;
