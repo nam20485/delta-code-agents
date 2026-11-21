@@ -61,7 +61,10 @@ export function resolveDeltaBinary(): string | null {
   return null;
 }
 
-/** First JSON object line in `text`, or null. */
+/**
+ * First JSON value in `text`: a fast per-line pass, then a substring pass
+ * for pretty-printed multi-line error objects (`{ ... }` spanning lines).
+ */
 export function parseFirstJson<T>(text: string): T | null {
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
@@ -69,7 +72,17 @@ export function parseFirstJson<T>(text: string): T | null {
     try {
       return JSON.parse(trimmed) as T;
     } catch {
-      // Try the next line.
+      // Try the next strategy.
+    }
+  }
+  const head = text.slice(0, 65_536);
+  const first = head.indexOf("{");
+  const last = head.lastIndexOf("}");
+  if (first !== -1 && last > first) {
+    try {
+      return JSON.parse(head.slice(first, last + 1)) as T;
+    } catch {
+      // Not JSON after all.
     }
   }
   return null;
@@ -143,3 +156,99 @@ export interface ContractInfo {
 export function threadContract(): Promise<DeltaResult<ContractInfo>> {
   return runDelta<ContractInfo>(["thread", "contract"]);
 }
+
+interface SpawnOutput {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+function spawnCollect(
+  bin: string,
+  args: readonly string[],
+  options: DeltaRunOptions,
+): Promise<SpawnOutput> {
+  return new Promise((resolve) => {
+    const child = spawn(bin, ["--json", ...args], { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, options.timeoutMs ?? 15_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code: null, stdout, stderr });
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code: code ?? null, stdout, stderr });
+    });
+    if (options.input !== undefined) {
+      child.stdin.end(options.input);
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+export interface JsonlResult<T> {
+  lines: T[];
+}
+
+/**
+ * Run a delta command whose stdout is one JSON object per line (e.g.
+ * `thread append`, which reports a receipt per record). Fails when the exit
+ * code is non-zero; unparsable lines are skipped.
+ */
+export async function runDeltaJsonl<T>(
+  args: readonly string[],
+  options: DeltaRunOptions = {},
+): Promise<DeltaResult<JsonlResult<T>>> {
+  const bin = resolveDeltaBinary();
+  if (bin === null) {
+    return {
+      ok: false,
+      error: { message: "delta CLI not found; install it from https://delta.dev" },
+      stderr: "",
+    };
+  }
+  const out = await spawnCollect(bin, args, options);
+  const lines = out.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("{"))
+    .map((line) => {
+      try {
+        return JSON.parse(line) as T;
+      } catch {
+        return null;
+      }
+    })
+    .filter((line): line is T => line !== null);
+  if (out.code === 0) {
+    return { ok: true, value: { lines } };
+  }
+  const errJson =
+    parseFirstJson<Record<string, unknown>>(out.stderr) ??
+    parseFirstJson<Record<string, unknown>>(out.stdout);
+  return {
+    ok: false,
+    error:
+      errJson !== null
+        ? normalizeError(errJson)
+        : { message: `delta exited with code ${out.code ?? "signal"}` },
+    stderr: out.stderr,
+  };
+}
+
