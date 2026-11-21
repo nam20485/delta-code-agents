@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -219,6 +219,67 @@ test("watch inbox injection, supersession deny, and mount swap", async () => {
     server.close();
     server.closeAllConnections();
     const pid = sidecarPid("it-2");
+    if (pid !== null) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("setup policy, join, pause, unshare, inbox, and clear split", async () => {
+  const dir3 = join(home, "sessions", "it-3");
+  const { port, server } = await startRouter();
+  try {
+    await post(port, { session_id: "it-3", hook_event_name: "SessionStart", source: "startup", cwd: home, delta_qwen_pid: process.pid });
+    const state3 = () => loadState(dir3);
+    assert.ok(await waitFor(() => (state3()?.port ?? 0) > 0, 10_000));
+    const sc3 = async (path: string, body?: unknown, method: "POST" | "GET" = "POST") => {
+      const st = state3()!;
+      const res = await fetch(`http://127.0.0.1:${st.port}${path}`, {
+        method,
+        headers: { "content-type": "application/json", authorization: `Bearer ${st.token}` },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      return (await res.json()) as Record<string, unknown>;
+    };
+
+    // setup team grants consent and auto-shares.
+    const setup = await sc3("/setup", { mode: "team" });
+    assert.equal(setup["status"], "shared");
+    assert.equal(state3()?.recording?.enabled, true);
+    assert.equal(state3()?.recording?.consent, "granted");
+    assert.equal(state3()?.recording?.thread_id, "fake-thread");
+    assert.equal(existsSync(join(home, ".delta", "settings.json")), true);
+
+    // inbox peek (no remote activity yet).
+    const inbox = await sc3("/inbox", undefined, "GET");
+    assert.equal(inbox["pending"], 0);
+
+    // join mounts the thread's checkout and returns the directory.
+    const joined = await sc3("/join", { link: "https://delta.dev/join/fake" });
+    assert.equal(joined["status"], "joined");
+    assert.equal(joined["directory"], "/tmp/fake-join-checkout");
+
+    // unshare makes the thread private.
+    const unshared = await sc3("/unshare", {});
+    assert.equal(unshared["status"], "shared");
+
+    // pause disables recording but keeps the thread id.
+    const paused = await sc3("/pause", {});
+    assert.equal(paused["status"], "shared");
+    assert.equal(state3()?.recording?.enabled, false);
+    assert.equal(state3()?.recording?.thread_id, "fake-thread");
+
+    // /clear splits into a fresh external id; the team policy then auto-starts
+    // recording on the new thread.
+    await post(port, { session_id: "it-3", hook_event_name: "SessionStart", source: "clear", cwd: home, delta_qwen_pid: process.pid });
+    assert.ok(await waitFor(() => state3()?.external_id === "it-3-c1", 5_000));
+    assert.ok(await waitFor(() => state3()?.recording?.enabled === true, 5_000));
+    assert.equal(state3()?.external_id, "it-3-c1");
+
+    await post(port, { session_id: "it-3", hook_event_name: "SessionEnd", reason: "prompt_input_exit" });
+    assert.ok(await waitFor(() => sidecarPid("it-3") === null, 5_000));
+  } finally {
+    server.close();
+    server.closeAllConnections();
+    const pid = sidecarPid("it-3");
     if (pid !== null) process.kill(pid, "SIGKILL");
   }
 });
