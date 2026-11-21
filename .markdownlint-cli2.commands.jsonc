@@ -1,0 +1,9 @@
+{
+  // Qwen slash-command files are prompt templates (frontmatter + !{} shell),
+  // not prose documents: no first-line-heading requirement. MD013 still
+  // applies to prose (tables/code/headings exempt, as in the main config).
+  "config": {
+    "MD013": { "tables": false, "code_blocks": false, "headings": false },
+    "MD041": false
+  }
+}

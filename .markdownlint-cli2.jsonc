@@ -1,5 +1,7 @@
 {
   // Table rows, fenced code, and headings cannot wrap at 80 columns.
+  // Qwen command templates in commands/ are linted separately with MD041
+  // disabled (see .markdownlint-cli2.commands.jsonc and validate.sh).
   "config": {
     "MD013": { "tables": false, "code_blocks": false, "headings": false }
   }
