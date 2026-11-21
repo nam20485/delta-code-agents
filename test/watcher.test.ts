@@ -165,4 +165,7 @@ test("an over-long author cannot stall the batch", () => {
   const batch = inbox.nextBatch();
   assert.notEqual(batch, null);
   assert.ok(batch!.text.length <= 8_200);
+  // Causal: the 80-char author cap must actually remove the long run; the
+  // first-entry slice alone would still pass a loose length bound.
+  assert.ok(!batch!.text.includes("x".repeat(100)));
 });

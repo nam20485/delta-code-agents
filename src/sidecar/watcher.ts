@@ -178,9 +178,12 @@ export class Watcher {
     });
     child.on("exit", (code, signal) => {
       this.opts.effects.log(`watch exited (${signal ?? "code " + String(code)})`);
-      // Only clear if this is still the current child; a newer one may exist.
-      if (this.child === child) this.child = null;
-      this.scheduleRestart();
+      // Only the current child's exit may arm a restart; a stale child's late
+      // exit must not kill/respawn the healthy replacement.
+      if (this.child === child) {
+        this.child = null;
+        this.scheduleRestart();
+      }
     });
     this.opts.effects.log(`watch started for ${this.opts.threadId}`);
   }
@@ -191,7 +194,11 @@ export class Watcher {
       | null
       | undefined;
     if (error != null) {
-      const retryable = error.retryable !== false;
+      // Match the plan/tryFlush contract: retry only when explicitly true.
+      // An off-contract permanent failure (auth, bad thread) gives up rather
+      // than churning the CLI forever; transient drops usually exit the child
+      // and reconnect via the exit path instead.
+      const retryable = error.retryable === true;
       if (!retryable) {
         this.opts.effects.log(`watch: non-retryable error ${str(error.reason)}; giving up`);
         this.stopped = true;
