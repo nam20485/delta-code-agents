@@ -14,4 +14,6 @@ echo "== build (tsc) =="
 ./node_modules/.bin/tsc -p .
 
 echo "== tests (node --test) =="
-node --test dist/test/
+# Explicit file list: node >= 22 treats --test args as globs and would try to
+# execute the bare directory path itself.
+node --test dist/test/*.test.js
