@@ -14,6 +14,8 @@ import { loadState, newState, saveState, type RecordingState, type SessionState 
 import { Outbox, type FlushTarget } from "./outbox.js";
 import { Recorder } from "./recorder.js";
 import { Mounts } from "./mounts.js";
+import { Inbox } from "./inbox.js";
+import { Watcher } from "./watcher.js";
 
 const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const OWNER_POLL_MS = 2_000;
@@ -124,6 +126,8 @@ export class Sidecar {
   private outbox: Outbox | null = null;
   private recorder: Recorder | null = null;
   private mounts: Mounts | null = null;
+  private inbox: Inbox | null = null;
+  private watcher: Watcher | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
@@ -199,6 +203,27 @@ export class Sidecar {
       ) {
         void this.mounts.restore(recording.worktree_reference, this.state.cwd);
       }
+      // Remote activity: watch the thread, feed the inbox, react to
+      // supersession and attachment changes.
+      this.inbox = new Inbox(this.dir);
+      this.watcher = new Watcher({
+        threadId: recording.thread_id,
+        externalId: this.state.external_id,
+        ownerPid: () => this.state.qwen_pid,
+        inbox: this.inbox,
+        effects: {
+          onSuperseded: () => {
+            if (this.state.recording !== undefined && !this.state.recording.superseded) {
+              this.state.recording.superseded = true;
+              this.save();
+              this.log("superseded via producer.turn; new turn content stops");
+            }
+          },
+          onWorktreesChanged: () => this.mounts?.swapThreadMount(),
+          log: (line) => this.log(line),
+        },
+      });
+      this.watcher.start();
       this.flushTimer = setInterval(() => {
         void this.tryFlush();
       }, FLUSH_RETRY_MS);
@@ -429,9 +454,53 @@ export class Sidecar {
         ? (event["hook_event_name"] as string)
         : "unknown";
     this.log(`event ${name}`);
+
+    // Supersession gate (plan): once a teammate takes over the thread, deny
+    // further tool calls with a reason the model sees. The user presses Esc;
+    // qwen has no external cancellation API.
+    if (
+      name === "PreToolUse" &&
+      this.state.recording?.enabled === true &&
+      this.state.recording.superseded
+    ) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            "A teammate took over this Delta thread. Stop working here; the user can press Esc to end the turn.",
+        },
+      };
+    }
+
     const recorder = this.ensureRecorder();
     if (recorder !== null) {
       recorder.record(event as Record<string, unknown>);
+    }
+
+    // Inbox delivery: inject pending teammate activity into a user-initiated
+    // turn. Mark delivered only once the response has been written back to
+    // Qwen (deferred to response close). A turn cancelled after delivery is
+    // unobservable from here; the unique delivery id keeps any redelivery
+    // from being deduped away.
+    let response: HookResponse = {};
+    if (
+      name === "UserPromptSubmit" &&
+      typeof event["submitted_prompt"] === "string" &&
+      this.inbox !== null
+    ) {
+      const batch = this.inbox.nextBatch();
+      if (batch !== null) {
+        response = {
+          hookSpecificOutput: {
+            hookEventName: "UserPromptSubmit",
+            additionalContext: batch.text,
+          },
+        };
+        const ids = batch.ids;
+        if (defer !== undefined) defer(() => this.inbox?.markDelivered(ids));
+        else this.inbox.markDelivered(ids);
+      }
     }
     // Response first, side effects after: the router treats a slow or reset
     // response as a dead sidecar and would spawn a second writer. Flushing
@@ -447,7 +516,7 @@ export class Sidecar {
         // (Per-clear thread splitting via an external-id suffix lands in M4.)
         if (defer !== undefined) defer(() => void this.tryFlush());
         else void this.tryFlush();
-        return {};
+        return response;
       }
       if (defer !== undefined) {
         defer(() => void this.shutdown("session end"));
@@ -455,7 +524,7 @@ export class Sidecar {
         void this.shutdown("session end");
       }
     }
-    return {};
+    return response;
   }
 
   startOwnerPolling(): void {
@@ -481,6 +550,7 @@ export class Sidecar {
       // Best effort.
     }
     const pending = this.outbox?.size ?? 0;
+    this.watcher?.stop();
     this.mounts?.stopAll();
     this.state.ended_at = new Date().toISOString();
     try {

@@ -55,6 +55,20 @@ export class Mounts {
     this.opts.log(`restored mounts for ${reference}`);
   }
 
+  /** A `worktrees` watch frame means attachments changed: restart the
+   * thread-mount keepalive with the same owner (plan: mount swap). */
+  swapThreadMount(): void {
+    for (let i = this.children.length - 1; i >= 0; i--) {
+      const entry = this.children[i]!;
+      if (entry.label === "thread-mount") {
+        entry.child.kill("SIGTERM");
+        this.children.splice(i, 1);
+      }
+    }
+    this.spawnDelta("thread-mount", ["thread", "mount", "--owner", this.opts.sessionId, this.opts.threadId]);
+    this.opts.log("swapped thread mount after worktrees change");
+  }
+
   private spawnDelta(label: string, args: string[]): ChildProcess | null {
     const bin = resolveDeltaBinary();
     if (bin === null) {
