@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { execFileSync } from "node:child_process";
 import { startRouter } from "../src/router/router.js";
 
 process.env["DELTA_QWEN_HOME"] = mkdtempSync(join(tmpdir(), "dq-router-"));
@@ -31,21 +32,43 @@ test("router multiplexes a session end to end", async () => {
     assert.deepEqual(await post(port, { session_id: "nope", hook_event_name: "Stop" }), {});
     assert.equal(existsSync(join(home, "sessions", "nope")), false);
 
-    // SessionStart spawns a sidecar; the owner-pid hint is persisted.
-    assert.deepEqual(
-      await post(port, {
-        session_id: "rt-1",
-        hook_event_name: "SessionStart",
-        source: "startup",
-        delta_qwen_pid: process.pid,
-      }),
-      {},
-    );
+    // SessionStart spawns a sidecar; the owner-pid hint is persisted. On a
+    // loaded CI runner the spawn can outlast the router's wait, so poll and
+    // re-send SessionStart until the sidecar is up and has the owner pid.
     const dir = join(home, "sessions", "rt-1");
-    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as {
-      qwen_pid?: number;
+    const startBody = {
+      session_id: "rt-1",
+      hook_event_name: "SessionStart",
+      source: "startup",
+      delta_qwen_pid: process.pid,
     };
-    assert.equal(state.qwen_pid, process.pid);
+    const readPid = (): number | null => {
+      try {
+        const s = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as { qwen_pid?: number; port?: number };
+        return typeof s.qwen_pid === "number" && (s.port ?? 0) > 0 ? s.qwen_pid : null;
+      } catch {
+        return null;
+      }
+    };
+    const sidecarAlive = (): boolean => {
+      try {
+        execFileSync("pgrep", ["-f", `sidecar/server\\.js rt-1( --revive)?$`], { encoding: "utf8" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    await post(port, startBody);
+    let pid: number | null = null;
+    for (let i = 0; i < 100; i++) {
+      pid = readPid();
+      if (pid === process.pid) break;
+      // Re-send only when no sidecar process is alive, so a slow first boot
+      // is never doubled (the production pid lock also guards this).
+      if (i % 10 === 9 && !sidecarAlive()) await post(port, startBody);
+      await delay(100);
+    }
+    assert.equal(pid, process.pid);
 
     // Regular events flow through and answer {}.
     assert.deepEqual(

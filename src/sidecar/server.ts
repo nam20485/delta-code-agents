@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { appendFile } from "node:fs/promises";
-import { readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -14,6 +14,8 @@ import { loadState, newState, saveState, type RecordingState, type SessionState 
 import { Outbox, type FlushTarget } from "./outbox.js";
 import { Recorder } from "./recorder.js";
 import { Mounts } from "./mounts.js";
+import { Inbox } from "./inbox.js";
+import { Watcher } from "./watcher.js";
 
 const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const OWNER_POLL_MS = 2_000;
@@ -124,6 +126,8 @@ export class Sidecar {
   private outbox: Outbox | null = null;
   private recorder: Recorder | null = null;
   private mounts: Mounts | null = null;
+  private inbox: Inbox | null = null;
+  private watcher: Watcher | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
@@ -199,6 +203,27 @@ export class Sidecar {
       ) {
         void this.mounts.restore(recording.worktree_reference, this.state.cwd);
       }
+      // Remote activity: watch the thread, feed the inbox, react to
+      // supersession and attachment changes.
+      this.inbox = new Inbox(this.dir);
+      this.watcher = new Watcher({
+        threadId: recording.thread_id,
+        externalId: this.state.external_id,
+        ownerPid: () => this.state.qwen_pid,
+        inbox: this.inbox,
+        effects: {
+          onSuperseded: () => {
+            if (this.state.recording !== undefined && !this.state.recording.superseded) {
+              this.state.recording.superseded = true;
+              this.save();
+              this.log("superseded via producer.turn; new turn content stops");
+            }
+          },
+          onWorktreesChanged: () => this.mounts?.swapThreadMount(),
+          log: (line) => this.log(line),
+        },
+      });
+      this.watcher.start();
       this.flushTimer = setInterval(() => {
         void this.tryFlush();
       }, FLUSH_RETRY_MS);
@@ -357,20 +382,27 @@ export class Sidecar {
           sendJson(res, 400, { error: "invalid json" });
           return;
         }
-        const deferred: (() => void)[] = [];
-        const response = await this.handleEvent(event, (fn) => deferred.push(fn));
+        const finishDeferred: (() => void)[] = [];
+        const closeDeferred: (() => void)[] = [];
+        const response = await this.handleEvent(event, (fn, mode = "close") => {
+          (mode === "finish" ? finishDeferred : closeDeferred).push(fn);
+        });
         sendJson(res, 200, response);
-        // 'close' fires on success AND client abort; 'finish' never fires
-        // when the client drops the connection before the flush completes.
-        res.on("close", () => {
-          for (const fn of deferred) {
+        const run = (fns: (() => void)[]): void => {
+          for (const fn of fns) {
             try {
               fn();
             } catch {
               // Fire-and-forget side effects must not crash the listener.
             }
           }
-        });
+        };
+        // 'finish' fires only when the response was fully written to the
+        // client; delivery marking wants that success-only semantics so an
+        // aborted forward redelivers instead of being lost. 'close' fires on
+        // success AND abort, which is right for flush/shutdown side effects.
+        res.on("finish", () => run(finishDeferred));
+        res.on("close", () => run(closeDeferred));
         return;
       }
       if (req.method === "POST" && url === "/share") {
@@ -401,7 +433,7 @@ export class Sidecar {
 
   async handleEvent(
     event: HookEventPayload,
-    defer?: (fn: () => void) => void,
+    defer?: (fn: () => void, mode?: "finish" | "close") => void,
   ): Promise<HookResponse> {
     const pidHint = event["delta_qwen_pid"];
     // SessionStart carries a fresh owner pid (http-delivered events cannot
@@ -429,9 +461,68 @@ export class Sidecar {
         ? (event["hook_event_name"] as string)
         : "unknown";
     this.log(`event ${name}`);
+
+    // Supersession is turn-scoped, not permanent: a new user-initiated turn
+    // reclaims the thread for the local agent. If the teammate still owns it,
+    // Delta re-fences the next append and the flag is set again. Without this,
+    // one takeover would deny tool use for the rest of the session and across
+    // resume while inbox context kept arriving the agent could not act on.
+    if (
+      name === "UserPromptSubmit" &&
+      typeof event["submitted_prompt"] === "string" &&
+      this.state.recording?.superseded === true
+    ) {
+      this.state.recording.superseded = false;
+      this.save();
+      this.log("user reclaimed the turn; supersession cleared");
+    }
+
+    // Supersession gate (plan): once a teammate takes over the thread, deny
+    // further tool calls with a reason the model sees. The user presses Esc;
+    // qwen has no external cancellation API.
+    if (
+      name === "PreToolUse" &&
+      this.state.recording?.enabled === true &&
+      this.state.recording.superseded
+    ) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            "A teammate took over this Delta thread. Stop working here; the user can press Esc to end the turn, or send a new prompt to reclaim it.",
+        },
+      };
+    }
+
     const recorder = this.ensureRecorder();
     if (recorder !== null) {
       recorder.record(event as Record<string, unknown>);
+    }
+
+    // Inbox delivery: inject pending teammate activity into a user-initiated
+    // turn. Mark delivered only once the response has been written back to
+    // Qwen (deferred to response close). A turn cancelled after delivery is
+    // unobservable from here; the unique delivery id keeps any redelivery
+    // from being deduped away.
+    let response: HookResponse = {};
+    if (
+      name === "UserPromptSubmit" &&
+      typeof event["submitted_prompt"] === "string" &&
+      this.inbox !== null
+    ) {
+      const batch = this.inbox.nextBatch();
+      if (batch !== null) {
+        response = {
+          hookSpecificOutput: {
+            hookEventName: "UserPromptSubmit",
+            additionalContext: batch.text,
+          },
+        };
+        const ids = batch.ids;
+        if (defer !== undefined) defer(() => this.inbox?.markDelivered(ids), "finish");
+        else this.inbox.markDelivered(ids);
+      }
     }
     // Response first, side effects after: the router treats a slow or reset
     // response as a dead sidecar and would spawn a second writer. Flushing
@@ -447,7 +538,7 @@ export class Sidecar {
         // (Per-clear thread splitting via an external-id suffix lands in M4.)
         if (defer !== undefined) defer(() => void this.tryFlush());
         else void this.tryFlush();
-        return {};
+        return response;
       }
       if (defer !== undefined) {
         defer(() => void this.shutdown("session end"));
@@ -455,7 +546,7 @@ export class Sidecar {
         void this.shutdown("session end");
       }
     }
-    return {};
+    return response;
   }
 
   startOwnerPolling(): void {
@@ -481,6 +572,7 @@ export class Sidecar {
       // Best effort.
     }
     const pending = this.outbox?.size ?? 0;
+    this.watcher?.stop();
     this.mounts?.stopAll();
     this.state.ended_at = new Date().toISOString();
     try {
@@ -575,6 +667,71 @@ function cleanupStaleSessions(currentSessionId: string): void {
 export async function startSidecar(sessionId: string): Promise<void> {
   const dir = sessionDir(sessionId);
   ensureDir(dir);
+
+  // Single-instance guard: a slow boot must not let a second spawn become a
+  // second writer on the same state dir. An exclusive pid lock names the
+  // owner; a live owner means another sidecar already serves this session.
+  const lockPath = join(dir, "sidecar.pid");
+  // Create-and-write atomically through the fd so the lock is never empty.
+  const writePidLock = (): boolean => {
+    let fd: number;
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+    } catch {
+      return false;
+    }
+    try {
+      writeSync(fd, String(process.pid));
+    } catch {
+      // A failed write must not leave a zero-byte lock that wedges the
+      // session (every later spawn would read empty and exit). Remove our
+      // own just-created lock and let the next re-send acquire cleanly.
+      try {
+        rmSync(lockPath, { force: true });
+      } catch {
+        // Best effort.
+      }
+      return false;
+    } finally {
+      closeSync(fd);
+    }
+    return true;
+  };
+  const readOwner = (): number | null => {
+    try {
+      const n = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+      return Number.isInteger(n) ? n : null;
+    } catch {
+      return null;
+    }
+  };
+  if (!writePidLock()) {
+    const owner = readOwner();
+    // Unparsable/empty or vanished lock: assume another spawn owns it; never
+    // delete a lock we cannot positively identify as stale.
+    if (owner === null || pidAlive(owner)) process.exit(0);
+    // Stale lock from a crashed sidecar: reclaim atomically. Re-read right
+    // before deleting so a stalled reclaimer cannot remove a lock that a
+    // winner has since re-acquired with a live pid.
+    if (readOwner() !== owner) process.exit(0);
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      process.exit(0);
+    }
+    if (!writePidLock()) process.exit(0);
+  }
+  // Confirm we still own it after the write (a concurrent reclaim may have
+  // replaced the lock between our create and this read).
+  if (readOwner() !== process.pid) process.exit(0);
+  process.on("exit", () => {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // Best effort.
+    }
+  });
+
   let state = loadState(dir);
   if (state === null || state.session_id !== sessionId) {
     state = newState(sessionId);
