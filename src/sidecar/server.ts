@@ -405,6 +405,12 @@ export class Sidecar {
     // --organization + --visibility private; fall back to the current org.
     const organization = policyOrg ?? (await currentOrganization()) ?? undefined;
     if (stale()) return { ok: false, error: "session reset during enable" };
+    if (organization === undefined) {
+      this.log(
+        "no organization resolved (policy or `delta org current`); a plain " +
+          "thread create rejects appends with not_shared — recording may not flush",
+      );
+    }
     const created = await runDeltaCreate(this.state.external_id, organization);
     if (stale()) return { ok: false, error: "session reset during enable" };
     if (!created.ok) return { ok: false, error: created.error };

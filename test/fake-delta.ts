@@ -2,7 +2,7 @@
 // Fake `delta` CLI for tests: `thread append` receipts on stdout, error
 // modes on stderr. Controlled by FAKE_MODE (ok|partial|error|reload),
 // FAKE_DISPOSITION (recorded|duplicate), FAKE_FENCE_SEQ.
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 interface RecordLine {
   sequence?: number;
@@ -12,6 +12,15 @@ async function main(): Promise<void> {
   const mode = process.env["FAKE_MODE"] ?? "ok";
   let args = process.argv.slice(2);
   if (args[0] === "--json") args = args.slice(1);
+  // Optionally record every invocation's args so tests can assert flags.
+  const argsFile = process.env["FAKE_ARGS_FILE"];
+  if (argsFile !== undefined && argsFile.length > 0) {
+    try {
+      appendFileSync(argsFile, `${JSON.stringify(args)}\n`);
+    } catch {
+      // Best effort.
+    }
+  }
   // NOTE: never `process.exit()` right after writing — pipes truncate. Set
   // exitCode and let node flush and exit on its own.
   if (args[0] === "thread" && args[1] === "contract") {
