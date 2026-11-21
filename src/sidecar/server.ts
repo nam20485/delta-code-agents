@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { appendFile } from "node:fs/promises";
-import { readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -667,6 +667,41 @@ function cleanupStaleSessions(currentSessionId: string): void {
 export async function startSidecar(sessionId: string): Promise<void> {
   const dir = sessionDir(sessionId);
   ensureDir(dir);
+
+  // Single-instance guard: a slow boot must not let a second spawn become a
+  // second writer on the same state dir. An exclusive pid lock names the
+  // owner; a live owner means another sidecar already serves this session.
+  const lockPath = join(dir, "sidecar.pid");
+  const acquire = (): boolean => {
+    try {
+      closeSync(openSync(lockPath, "wx", 0o600));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!acquire()) {
+    const existing = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    if (Number.isInteger(existing) && pidAlive(existing)) {
+      process.exit(0);
+    }
+    // Stale lock from a crashed sidecar: reclaim it.
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      process.exit(0);
+    }
+    if (!acquire()) process.exit(0);
+  }
+  writeFileSync(lockPath, String(process.pid), { mode: 0o600 });
+  process.on("exit", () => {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // Best effort.
+    }
+  });
+
   let state = loadState(dir);
   if (state === null || state.session_id !== sessionId) {
     state = newState(sessionId);

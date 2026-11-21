@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { execFileSync } from "node:child_process";
 import { startRouter } from "../src/router/router.js";
 
 process.env["DELTA_QWEN_HOME"] = mkdtempSync(join(tmpdir(), "dq-router-"));
@@ -43,10 +44,18 @@ test("router multiplexes a session end to end", async () => {
     };
     const readPid = (): number | null => {
       try {
-        const s = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as { qwen_pid?: number };
-        return typeof s.qwen_pid === "number" ? s.qwen_pid : null;
+        const s = JSON.parse(readFileSync(join(dir, "state.json"), "utf8")) as { qwen_pid?: number; port?: number };
+        return typeof s.qwen_pid === "number" && (s.port ?? 0) > 0 ? s.qwen_pid : null;
       } catch {
         return null;
+      }
+    };
+    const sidecarAlive = (): boolean => {
+      try {
+        execFileSync("pgrep", ["-f", `sidecar/server\\.js rt-1( --revive)?$`], { encoding: "utf8" });
+        return true;
+      } catch {
+        return false;
       }
     };
     await post(port, startBody);
@@ -54,7 +63,9 @@ test("router multiplexes a session end to end", async () => {
     for (let i = 0; i < 100; i++) {
       pid = readPid();
       if (pid === process.pid) break;
-      if (i % 10 === 9) await post(port, startBody);
+      // Re-send only when no sidecar process is alive, so a slow first boot
+      // is never doubled (the production pid lock also guards this).
+      if (i % 10 === 9 && !sidecarAlive()) await post(port, startBody);
       await delay(100);
     }
     assert.equal(pid, process.pid);
