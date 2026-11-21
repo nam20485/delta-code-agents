@@ -168,7 +168,9 @@ async function setup(mode: string, org: string | undefined): Promise<number> {
   }
   const body = await fetchSidecar("/setup", { mode, ...(org !== undefined ? { organization: org } : {}) });
   if (body === null) return noSession();
-  console.log(`Sync policy for this repository: ${mode}`);
+  if (body["status"] !== "error") {
+    console.log(`Sync policy for this repository: ${mode}`);
+  }
   return printShare(body);
 }
 
@@ -269,18 +271,15 @@ async function doctor(): Promise<number> {
 }
 
 /**
- * Command arguments. Slash-command templates pass user input via the
- * DELTA_QWEN_ARGS environment variable (`--from-env`) so untrusted text is
- * never parsed by the shell — only split here in JS. Direct CLI use reads
- * process.argv.
+ * Command arguments from process.argv. Slash-command templates interpolate
+ * `{{args}}` into the `!{}` shell line; Qwen Code shell-escapes `{{args}}`
+ * inside `!{}` before execution (documented in its commands guide), which is
+ * the host boundary that both prevents shell injection and preserves
+ * multi-word arguments. Qwen custom commands offer no non-textual argument
+ * channel, so this escaping is the mitigation we rely on.
  */
 function commandArgs(): string[] {
-  const argv = process.argv.slice(3);
-  if (argv.includes("--from-env")) {
-    const raw = (process.env["DELTA_QWEN_ARGS"] ?? "").trim();
-    return raw.length === 0 ? [] : raw.split(/\s+/);
-  }
-  return argv;
+  return process.argv.slice(3);
 }
 
 /** Parse `setup <mode> [--org ID | --org=ID]` positionally. */

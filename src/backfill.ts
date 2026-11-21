@@ -27,11 +27,14 @@ function updatesForLine(line: TranscriptLine, index: number): AcpUpdate[] {
   const id = typeof line.uuid === "string" ? line.uuid : String(index);
   const type = typeof line.type === "string" ? line.type : "";
   const out: AcpUpdate[] = [];
-  // Concatenate a line's non-thought text into ONE record: same-id resends
-  // replace in Delta, so one record per part would lose all but the last.
+  // Concatenate a line's non-thought text into ONE record (same-id resends
+  // replace in Delta), inserted at the position of the first text part so a
+  // trailing text after a functionResponse keeps the original part order.
   const texts: string[] = [];
+  let textIndex = -1;
   for (const part of partsOf(line)) {
     if (typeof part.text === "string" && part.text.trim().length > 0 && part.thought !== true) {
+      if (textIndex === -1) textIndex = out.length;
       texts.push(part.text);
     }
     const resp = part.functionResponse;
@@ -44,10 +47,19 @@ function updatesForLine(line: TranscriptLine, index: number): AcpUpdate[] {
   }
   if (texts.length > 0) {
     const body = texts.join("\n");
-    if (type === "user") out.unshift(userMessage(`u-${id}`, body));
-    else if (type === "assistant") out.unshift(agentMessage(`a-${id}`, body));
+    const message =
+      type === "user" ? userMessage(`u-${id}`, body)
+      : type === "assistant" ? agentMessage(`a-${id}`, body)
+      : null;
+    if (message !== null) out.splice(textIndex, 0, message);
   }
   return out;
+}
+
+export interface BackfillResult {
+  updates: AcpUpdate[];
+  /** True when older history was dropped to honor the cap. */
+  truncated: boolean;
 }
 
 /**
@@ -57,16 +69,18 @@ function updatesForLine(line: TranscriptLine, index: number): AcpUpdate[] {
  * `message.parts[]` with text / functionCall / functionResponse. Thinking
  * parts (`thought: true`) are skipped (no agent_thought records in v1).
  * Records are emitted as history (no turnSequence); live recording continues
- * after them. Streams the file (non-blocking) and caps the record count so a
- * tens-of-MB transcript cannot stall the sidecar's event loop.
+ * after them. Streams the file (non-blocking) and keeps the MOST RECENT
+ * MAX_BACKFILL_UPDATES records (the context teammates most need), flagging
+ * truncation so the caller can log the dropped older history.
  */
-export async function backfillTranscript(path: string): Promise<AcpUpdate[]> {
+export async function backfillTranscript(path: string): Promise<BackfillResult> {
   const updates: AcpUpdate[] = [];
+  let total = 0;
   let stream;
   try {
     stream = createReadStream(path, { encoding: "utf8" });
   } catch {
-    return updates;
+    return { updates, truncated: false };
   }
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   let index = 0;
@@ -82,7 +96,9 @@ export async function backfillTranscript(path: string): Promise<AcpUpdate[]> {
       }
       for (const update of updatesForLine(line, index)) {
         updates.push(update);
-        if (updates.length >= MAX_BACKFILL_UPDATES) return updates;
+        total += 1;
+        // Keep the most recent records: drop the oldest once over the cap.
+        if (updates.length > MAX_BACKFILL_UPDATES) updates.shift();
       }
       index += 1;
     }
@@ -92,5 +108,5 @@ export async function backfillTranscript(path: string): Promise<AcpUpdate[]> {
     lines.close();
     stream.destroy();
   }
-  return updates;
+  return { updates, truncated: total > updates.length };
 }

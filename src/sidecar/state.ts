@@ -73,7 +73,16 @@ export function stateFile(dir: string): string {
 }
 
 export function loadState(dir: string): SessionState | null {
-  return readJson<SessionState>(stateFile(dir));
+  const state = readJson<SessionState>(stateFile(dir));
+  if (state === null) return null;
+  // Migrate pre-generation state: a missing/non-numeric generation would
+  // otherwise produce outbox-undefined.jsonl / NaN filenames and strand
+  // legacy records and inbox delivered flags.
+  if (typeof state.generation !== "number" || !Number.isFinite(state.generation)) {
+    state.generation = 0;
+  }
+  if (typeof state.clear_count !== "number") state.clear_count = 0;
+  return state;
 }
 
 export function saveState(dir: string, state: SessionState): void {

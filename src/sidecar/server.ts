@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { appendFile } from "node:fs/promises";
-import { closeSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -132,6 +132,8 @@ export class Sidecar {
   private watcher: Watcher | null = null;
   private shareInFlight: Promise<ShareResponse> | null = null;
   private shareInFlightConfirm = false;
+  private enableInFlight: Promise<{ ok: true } | { ok: false; error: string }> | null = null;
+  private eventBuffer: Record<string, unknown>[] = [];
   private lastFlushError: { retryable: boolean; retryAfterMs: number; at: number; size: number } | null = null;
 
   constructor(state: SessionState, dir: string) {
@@ -332,11 +334,33 @@ export class Sidecar {
     return join(this.dir, `outbox-${this.state.generation}.jsonl`);
   }
 
-  /** Contract gate + idempotent thread create + backfill + checkout adoption. */
-  private async enableRecording(organization?: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  /**
+   * Contract gate + idempotent thread create + backfill + checkout adoption.
+   * Serialized: concurrent callers (deferred SessionStart applyPolicy, /setup,
+   * /share) share one in-flight enable so the transcript is backfilled once
+   * and the checkout adopted once. Events arriving during the enable window
+   * are buffered and replayed afterwards (not dropped).
+   */
+  private enableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (this.enableInFlight !== null) return this.enableInFlight;
+    this.enableInFlight = this.doEnableRecording().finally(() => {
+      this.enableInFlight = null;
+      this.drainEventBuffer();
+    });
+    return this.enableInFlight;
+  }
+
+  private async doEnableRecording(): Promise<{ ok: true } | { ok: false; error: string }> {
     const recording = this.recordingState();
     if (recording.enabled) return { ok: true };
+    const generation = this.state.generation;
+    // A /clear during any await bumps the generation and replaces recording;
+    // re-check after each await so we never write into the new generation.
+    const stale = (): boolean =>
+      this.state.generation !== generation || this.state.recording !== recording;
+    const organization = readPolicy(this.state.cwd).organization;
     const contract = await threadContract();
+    if (stale()) return { ok: false, error: "session reset during enable" };
     if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
       return {
         ok: false,
@@ -346,19 +370,24 @@ export class Sidecar {
       };
     }
     const created = await runDeltaCreate(this.state.external_id, organization);
+    if (stale()) return { ok: false, error: "session reset during enable" };
     if (!created.ok) return { ok: false, error: created.error };
     // Backfill BEFORE enabling: while enabled is false no live recorder exists,
-    // so concurrent events cannot bump next_sequence (race-free), and the
-    // async stream runs without a live turn waiting on the event loop.
+    // so concurrent events cannot bump next_sequence. The async stream keeps
+    // the most recent history; events during the window are buffered.
     if (this.state.transcript_path !== undefined && recording.next_sequence === 1) {
-      const updates = await backfillTranscript(this.state.transcript_path);
+      const { updates, truncated } = await backfillTranscript(this.state.transcript_path);
+      if (stale()) return { ok: false, error: "session reset during enable" };
       if (updates.length > 0) {
         const outbox = new Outbox(this.outboxFile());
         for (const update of updates) {
           outbox.add({ sequence: recording.next_sequence, update });
           recording.next_sequence += 1;
         }
-        this.log(`backfilled ${updates.length} historical records`);
+        this.log(
+          `backfilled ${updates.length} historical records` +
+            (truncated ? " (older history truncated to the most recent records)" : ""),
+        );
       }
     }
     recording.thread_id = created.threadId;
@@ -369,6 +398,7 @@ export class Sidecar {
     this.ensureRecorder();
     if (this.state.cwd.length > 0 && recording.worktree_reference === undefined) {
       const result = await this.ensureMounts().adoptCheckout(this.state.cwd);
+      if (stale()) return { ok: false, error: "session reset during enable" };
       if (result.ok && typeof result.reference === "string") {
         recording.worktree_reference = result.reference;
         this.save();
@@ -377,6 +407,23 @@ export class Sidecar {
       }
     }
     return { ok: true };
+  }
+
+  /** Replay events buffered while an enable was in flight. */
+  private drainEventBuffer(): void {
+    const buffered = this.eventBuffer;
+    this.eventBuffer = [];
+    if (buffered.length === 0) return;
+    const recorder = this.ensureRecorder();
+    if (recorder === null) {
+      this.log(`dropped ${buffered.length} buffered events (recording not enabled)`);
+      return;
+    }
+    for (const ev of buffered) {
+      recorder.record(ev);
+      const n = ev["hook_event_name"];
+      if (n === "Stop" || n === "StopFailure" || n === "SessionEnd") void this.tryFlush();
+    }
   }
 
   private shareResponse(shared: { ok: true; url: string | null } | { ok: false; error: string }): ShareResponse {
@@ -408,7 +455,7 @@ export class Sidecar {
     const recording = this.recordingState();
     recording.consent = "granted";
     this.save();
-    const enabled = await this.enableRecording(policy.organization);
+    const enabled = await this.enableRecording();
     if (!enabled.ok) return { status: "error", message: enabled.error };
     if (policy.mode === "team") {
       const shared = await runDeltaShare(recording.thread_id);
@@ -508,9 +555,9 @@ export class Sidecar {
     this.state.generation += 1;
     this.state.external_id = `${this.state.session_id}-c${this.state.clear_count}`;
     // A fresh generation gives the new conversation empty outbox/inbox files,
-    // so pre-clear records can never be appended to the new thread. Drop the
-    // old transcript path so the cleared conversation is not backfilled.
-    delete this.state.transcript_path;
+    // so pre-clear records can never be appended to the new thread. The
+    // SessionStart capture already overwrote transcript_path with the new
+    // conversation's transcript, so post-clear backfill uses the fresh file.
     this.watcher?.stop();
     this.watcher = null;
     this.mounts?.stopAll();
@@ -777,11 +824,17 @@ export class Sidecar {
       };
     }
 
+    // Buffer events that arrive while an enable is in flight (recording not
+    // yet enabled); they are replayed once the recorder exists, not dropped.
+    if (this.enableInFlight !== null) {
+      this.eventBuffer.push(event as Record<string, unknown>);
+      return {};
+    }
+
     const recorder = this.ensureRecorder();
     if (recorder !== null) {
       recorder.record(event as Record<string, unknown>);
     }
-
     // Inbox delivery: inject pending teammate activity into a user-initiated
     // turn. Mark delivered only once the response has been written back to
     // Qwen (deferred to response close). A turn cancelled after delivery is
@@ -900,13 +953,18 @@ function cleanupStaleSessions(currentSessionId: string): void {
     } catch {
       continue;
     }
-    // Undelivered records outrank every grace period. A stat check avoids
-    // reading/parsing megabytes of outbox per session on the event loop.
+    // Undelivered records outrank every grace period. Outbox files are
+    // generation-suffixed (outbox-<gen>.jsonl); a stat check on any of them
+    // avoids reading/parsing megabytes per session on the event loop.
     let outboxBytes = 0;
     try {
-      outboxBytes = statSync(join(dir, "outbox.jsonl")).size;
+      for (const entry of readdirSync(dir)) {
+        if (entry.startsWith("outbox-") && entry.endsWith(".jsonl")) {
+          outboxBytes += statSync(join(dir, entry)).size;
+        }
+      }
     } catch {
-      // No outbox file.
+      // No outbox files.
     }
     if (outboxBytes > 0) continue;
     const state = loadState(dir);
@@ -1024,6 +1082,18 @@ export async function startSidecar(sessionId: string): Promise<void> {
     delete state.ended_at;
   }
   saveState(dir, state);
+  // Migrate legacy (pre-generation) outbox/inbox filenames so pending records
+  // and delivered flags survive the upgrade instead of being stranded.
+  try {
+    const legacyOutbox = join(dir, "outbox.jsonl");
+    const genOutbox = join(dir, `outbox-${state.generation}.jsonl`);
+    if (existsSync(legacyOutbox) && !existsSync(genOutbox)) renameSync(legacyOutbox, genOutbox);
+    const legacyInbox = join(dir, "inbox.json");
+    const genInbox = join(dir, `inbox-${state.generation}.json`);
+    if (existsSync(legacyInbox) && !existsSync(genInbox)) renameSync(legacyInbox, genInbox);
+  } catch {
+    // Best effort.
+  }
   const sidecar = new Sidecar(state, dir);
   const server = createServer((req, res) => {
     void sidecar.route(req, res);
