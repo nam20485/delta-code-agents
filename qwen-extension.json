@@ -1,6 +1,6 @@
 {
   "name": "delta-qwen",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "displayName": "Delta",
   "description": "Record Qwen Code sessions and their Git checkouts into Delta threads.",
   "hooks": {

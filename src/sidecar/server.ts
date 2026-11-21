@@ -8,7 +8,7 @@ import { timingSafeEqual } from "node:crypto";
 import { ensureDir } from "../lib/fsx.js";
 import { pidAlive } from "../lib/proc.js";
 import { DELTA_SOURCE, PRODUCER_NAME } from "../lib/constants.js";
-import { REQUIRED_CONTRACT, runDelta, threadContract } from "../delta-cli.js";
+import { REQUIRED_CONTRACT, currentOrganization, runDelta, threadContract } from "../delta-cli.js";
 import { readPolicy, writePolicy, isSyncMode, type ProjectPolicy, type SyncMode } from "../policy.js";
 import { backfillTranscript } from "../backfill.js";
 import { sessionDir, sessionsRoot } from "../lib/paths.js";
@@ -389,7 +389,7 @@ export class Sidecar {
     // re-check after each await so we never write into the new generation.
     const stale = (): boolean =>
       this.state.generation !== generation || this.state.recording !== recording;
-    const organization = readPolicy(this.state.cwd).organization;
+    const policyOrg = readPolicy(this.state.cwd).organization;
     const contract = await threadContract();
     if (stale()) return { ok: false, error: "session reset during enable" };
     if (!contract.ok || contract.value.max < REQUIRED_CONTRACT) {
@@ -399,6 +399,17 @@ export class Sidecar {
           ? `delta thread contract max ${contract.value.max} < ${REQUIRED_CONTRACT}; update Delta`
           : contract.error.message,
       };
+    }
+    // Record an upload intent so records can append before sharing: a plain
+    // `thread create` rejects appends with not_shared. Private mode needs
+    // --organization + --visibility private; fall back to the current org.
+    const organization = policyOrg ?? (await currentOrganization()) ?? undefined;
+    if (stale()) return { ok: false, error: "session reset during enable" };
+    if (organization === undefined) {
+      this.log(
+        "no organization resolved (policy or `delta org current`); a plain " +
+          "thread create rejects appends with not_shared — recording may not flush",
+      );
     }
     const created = await runDeltaCreate(this.state.external_id, organization);
     if (stale()) return { ok: false, error: "session reset during enable" };

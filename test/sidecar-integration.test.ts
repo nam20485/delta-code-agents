@@ -283,3 +283,38 @@ test("setup policy, join, pause, unshare, inbox, and clear split", async () => {
     if (pid !== null) process.kill(pid, "SIGKILL");
   }
 });
+
+test("enable passes organization and visibility private to thread create", async () => {
+  const argsFile = join(home, "fake-args.jsonl");
+  process.env["FAKE_ARGS_FILE"] = argsFile;
+  const dirF = join(home, "sessions", "it-flags");
+  const { port, server } = await startRouter();
+  try {
+    await post(port, { session_id: "it-flags", hook_event_name: "SessionStart", source: "startup", cwd: home, delta_qwen_pid: process.pid });
+    assert.ok(await waitFor(() => (loadState(dirF)?.port ?? 0) > 0, 10_000));
+    const st = loadState(dirF)!;
+    const res = await fetch(`http://127.0.0.1:${st.port}/setup`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${st.token}` },
+      body: JSON.stringify({ mode: "private" }),
+    });
+    assert.equal(((await res.json()) as Record<string, unknown>)["status"], "shared");
+    // The fake records every invocation's args; the create must carry the
+    // upload-intent flags (dropping them would regress private-mode flush).
+    const calls = readFileSync(argsFile, "utf8").split("\n").filter((l) => l.startsWith("[")).map((l) => JSON.parse(l) as string[]);
+    const create = calls.find((a) => a[0] === "thread" && a[1] === "create");
+    assert.notEqual(create, undefined);
+    const oi = create!.indexOf("--organization");
+    assert.ok(oi !== -1 && create![oi + 1] === "org_fake");
+    const vi = create!.indexOf("--visibility");
+    assert.ok(vi !== -1 && create![vi + 1] === "private");
+    await post(port, { session_id: "it-flags", hook_event_name: "SessionEnd", reason: "prompt_input_exit" });
+    assert.ok(await waitFor(() => sidecarPid("it-flags") === null, 5_000));
+  } finally {
+    delete process.env["FAKE_ARGS_FILE"];
+    server.close();
+    server.closeAllConnections();
+    const pid = sidecarPid("it-flags");
+    if (pid !== null) process.kill(pid, "SIGKILL");
+  }
+});

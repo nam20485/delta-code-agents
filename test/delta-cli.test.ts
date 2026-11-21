@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseFirstJson, runDelta, threadContract } from "../src/delta-cli.js";
+import { fileURLToPath } from "node:url";
+import { parseFirstJson, runDelta, threadContract, currentOrganization } from "../src/delta-cli.js";
 
 function fakeDelta(script: string): string {
   const dir = mkdtempSync(join(tmpdir(), "dq-fake-delta-"));
@@ -52,8 +53,18 @@ test("parseFirstJson skips non-JSON lines", () => {
 });
 
 test("parseFirstJson handles pretty-printed multi-line errors", () => {
-  const pretty = 'delta: capture supports only the claude-code source\n{\n  "error": {\n    "code": "invalid_reference",\n    "reason": "invalid_identity",\n    "message": "capture supports only the claude-code source",\n    "retryable": false\n  }\n}\n';
+  const pretty = 'delta: capture supports only the claude-code source\n{\n  \"error\": {\n    \"code\": \"invalid_reference\",\n    \"reason\": \"invalid_identity\",\n    \"message\": \"capture supports only the claude-code source\",\n    \"retryable\": false\n  }\n}\n';
   const parsed = parseFirstJson<Record<string, unknown>>(pretty);
   assert.notEqual(parsed, null);
   assert.equal((parsed!["error"] as Record<string, unknown>)["reason"], "invalid_identity");
+});
+
+test("currentOrganization parses the org id and returns null on failure", async () => {
+  process.env["DELTA_QWEN_DELTA_BIN"] = fileURLToPath(new URL("./fake-delta.js", import.meta.url));
+  chmodSync(process.env["DELTA_QWEN_DELTA_BIN"], 0o755);
+  assert.equal(await currentOrganization(), "org_fake");
+  const saved = process.env["DELTA_QWEN_DELTA_BIN"];
+  process.env["DELTA_QWEN_DELTA_BIN"] = "/nonexistent/delta";
+  assert.equal(await currentOrganization(), null);
+  process.env["DELTA_QWEN_DELTA_BIN"] = saved;
 });

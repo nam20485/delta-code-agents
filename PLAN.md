@@ -393,7 +393,11 @@ in a throwaway Git repo:
    `--acknowledge` (private→local, shared→server). Live-verified: an Explorer
    subagent recorded as a child thread under the session.
 6. **Docs & release**: README (install via `qwen extensions install <repo
-   URL>`), AGENTS.md, release notes; live e2e pass per Verification.
+   URL>`), AGENTS.md, release notes; live e2e pass per Verification. **Done**:
+   README, CHANGELOG, AGPL-3.0 LICENSE, VERIFICATION.md (live e2e results);
+   version 0.6.0. The pass found and fixed a private-mode flush bug (plain
+   `thread create` rejects appends with `not_shared`; now records an upload
+   intent via `--organization --visibility private`).
 
 ## Key references
 
