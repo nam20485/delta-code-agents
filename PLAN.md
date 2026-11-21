@@ -189,6 +189,14 @@ Qwen edits the user's own checkout, so the thread must adopt it — a fresh
    edits with the `tool_use_id` used in the records (delta-claude's
    `hooks/recording/edit-capture.ts` is the reference).
 
+   **Observed on delta 0.28.4 (live probe):** `thread capture` rejects every
+   source except `claude-code` (`invalid_identity`, "capture supports only
+   the claude-code source"), and error JSON arrives pretty-printed across
+   multiple lines. The sidecar parses multi-line error objects, disables
+   capture for the session on that error, and warns in the share output;
+   edits then reach the thread unattributed. Revisit when Delta opens capture
+   to other sources.
+
 Non-Git cwd: record conversation only, note the limitation in status. A cwd
 that is already a Delta-managed worktree (e.g. under `.delta/worktrees/`):
 reuse its worktree reference instead of creating one.
