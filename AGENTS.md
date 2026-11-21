@@ -17,9 +17,14 @@ sidecar, `delta` CLI wrapper) is in place and recording lands with M2.
 - `qwen-extension.json` — extension manifest; registers one named command hook
   per event, all invoking `dist/src/hook.js` (built output — keep paths in
   sync with `tsconfig.json`).
-- `src/hook.ts` — hook dispatcher: stdin JSON → sidecar POST; fails open
-  (always exit 0, no output on failure) and maintains `~/.qwen/delta/cli.js`,
-  the stable launcher slash commands call.
+- `src/hook.ts` — SessionStart dispatcher: bootstraps the user-level router
+  (lock-guarded detached spawn), learns qwen's pid from its ancestry, and
+  maintains `~/.qwen/delta/cli.js`, the stable launcher slash commands call.
+  All other hook events are native http hooks straight to the router (per-
+  event command hooks measured ~390 ms p95 on this machine; http ~4 ms).
+- `src/router/router.ts` — fixed-port (47631) loopback daemon multiplexing
+  sessions by id: spawns per-session sidecars, forwards events with the
+  sidecar token, relays responses, fails open with `{}`.
 - `src/sidecar/` — per-session sidecar: token-authed localhost HTTP, session
   state (0700 dirs, 0600 files), owner-pid polling, stale-session cleanup.
 - `src/delta-cli.ts` — spawns `delta --json`, unwraps `{"error":{...}}`
