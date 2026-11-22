@@ -14,12 +14,18 @@ echo "== markdownlint =="
 ./node_modules/.bin/markdownlint-cli2 --config .markdownlint-cli2.commands.jsonc "commands/**/*.md"
 
 echo "== build (tsc) =="
+# Clean rebuild so orphaned outputs from deleted src files are removed too.
+rm -rf dist/src
 ./node_modules/.bin/tsc -p .
 
-# The committed dist/src must match a fresh build, so URL-install never ships
-# stale artifacts (a src change without a rebuild fails here).
+# The committed dist/src must exactly match a fresh build (modified, added, or
+# orphaned files all fail), so URL-install never ships stale artifacts.
 echo "== dist/src freshness =="
-git diff --exit-code -- dist/src
+if [ -n "$(git status --porcelain -- dist/src)" ]; then
+  git status --short -- dist/src
+  echo "dist/src is stale — rebuild and commit it" >&2
+  exit 1
+fi
 
 echo "== tests (node --test) =="
 # Explicit file list: node >= 22 treats --test args as globs and would try to
