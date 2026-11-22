@@ -20,7 +20,9 @@ database directly.
 
 ## Install
 
-From a Git checkout of this repository:
+The extension ships prebuilt (`dist/src` is committed) and has no runtime
+dependencies — only Node.js 20+. Installing from the URL works directly, with
+no build step:
 
 ```sh
 qwen extensions install https://github.com/nam20485/delta-code-agents
