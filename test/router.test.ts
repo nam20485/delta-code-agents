@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { execFileSync } from "node:child_process";
 import { startRouter } from "../src/router/router.js";
 
 process.env["DELTA_QWEN_HOME"] = mkdtempSync(join(tmpdir(), "dq-router-"));
@@ -22,6 +23,7 @@ async function post(port: number, body: unknown): Promise<Record<string, unknown
 }
 
 test("router multiplexes a session end to end", async () => {
+  const dir = join(home, "sessions", "rt-1");
   const { port, server } = await startRouter();
   try {
     const health = await fetch(`http://127.0.0.1:${port}/health`);
@@ -34,7 +36,6 @@ test("router multiplexes a session end to end", async () => {
     // SessionStart spawns a sidecar; the owner-pid hint is persisted. On a
     // loaded CI runner the spawn can outlast the router's wait, so poll and
     // re-send SessionStart until the sidecar is up and has the owner pid.
-    const dir = join(home, "sessions", "rt-1");
     const startBody = {
       session_id: "rt-1",
       hook_event_name: "SessionStart",
@@ -73,17 +74,39 @@ test("router multiplexes a session end to end", async () => {
       {},
     );
 
-    // SessionEnd tears the sidecar and its state dir down. Re-send periodically
-    // in case a forward was dropped on a loaded runner.
+    // SessionEnd tears the sidecar down. The reliable signal is the sidecar
+    // process exiting; dir removal can race with cleanup on a loaded runner,
+    // so assert process exit and tidy the dir in finally. Re-send SessionEnd
+    // periodically in case a forward was dropped.
     const endBody = { session_id: "rt-1", hook_event_name: "SessionEnd", reason: "prompt_input_exit" };
+    const sidecarAlive = (): boolean => {
+      try {
+        execFileSync("pgrep", ["-f", "sidecar/server\\.js rt-1"], { encoding: "utf8" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
     await post(port, endBody);
-    for (let i = 0; i < 300 && existsSync(dir); i++) {
+    let gone = false;
+    for (let i = 0; i < 300; i++) {
+      if (!sidecarAlive()) {
+        gone = true;
+        break;
+      }
       if (i % 20 === 19) await post(port, endBody);
       await delay(100);
     }
-    assert.equal(existsSync(dir), false);
+    assert.equal(gone, true);
   } finally {
     server.close();
     server.closeAllConnections();
+    try {
+      const pids = execFileSync("pgrep", ["-f", "sidecar/server\\.js rt-1"], { encoding: "utf8" }).trim();
+      for (const p of pids.split("\n")) if (p.length > 0) process.kill(Number.parseInt(p, 10), "SIGKILL");
+    } catch {
+      // No sidecar left.
+    }
+    rmSync(dir, { recursive: true, force: true });
   }
 });
