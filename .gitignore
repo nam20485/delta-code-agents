@@ -2,4 +2,6 @@
 .qwen/
 
 node_modules/
-dist/
+# Runtime build output (dist/src) is committed so `qwen extensions install`
+# works without a build step; test output is not needed at runtime.
+dist/test/
